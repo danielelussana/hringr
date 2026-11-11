@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>hringr</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  :fullscreen { cursor: none; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+"use strict";
+// Port in WebGL2 di hringr.py: stesse costanti, stessa scena, stessi shader (GLSL ES 3.00).
+const hex = h => [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) / 255);
+const LIGHT = ["E8E8EA", "C9D8E8", "A7C4E5"].map(hex);
+const BLUES = ["4399D3", "0083C8", "006CA8"].map(hex);
+const RING_CORE = hex("C9D8E8"), RING_GLOW = hex("0083C8"), RING_ECHO = hex("4399D3"),
+      RING_HALO = hex("006CA8"), PULSE_COL = hex("0083C8");
+const WAVES = [[3, .55, .9], [5, .30, -1.4], [8, .20, 2.2], [13, .12, -3.5], [21, .07, 5.5]];
+const TAB_N = 512, MAX_PULSES = 6, MAX_TRI = 12000;
+const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
+const rnd = (a, b) => a + Math.random() * (b - a);
+const gauss = s => s * Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
+const pick = a => a[Math.floor(Math.random() * a.length)];
+function poisson(l) {
+  if (l > 30) return Math.max(0, Math.round(l + Math.sqrt(l) * gauss(1)));
+  const L = Math.exp(-l); let k = 0, p = 1;
+  do { k++; p *= Math.random(); } while (p > L);
+  return k - 1;
+}
+const netNorm = (mbps, max) => Math.min(1, Math.log1p(Math.max(mbps, 0)) / Math.log1p(max));
+
+// ------------------------------------------------------------------ scena
+class Scene {
+  constructor(sizeMul, shape, inner, liq) {
+    Object.assign(this, { sizeMul, shape, inner, liq, flow: 0, level: 0, pin: 0, bri: 0, pulses: [],
+                          pulseTimer: 0, flash: 0, time: 0, r0: 1, n: 0, sc: 1 });
+    this.phase = new Float32Array(WAVES.length);
+    this.tab = new Float32Array(TAB_N * 2);               // riga 0: perimetro, riga 1: eco
+    const F = () => new Float32Array(MAX_TRI);
+    this.px = F(); this.py = F(); this.dx = F(); this.dy = F(); this.spd = F(); this.size = F();
+    this.cr = F(); this.cg = F(); this.cb = F(); this.ph = F(); this.R = F(); this.RING = F();
+    this.kind = new Uint8Array(MAX_TRI);
+    this.arrs = [this.px, this.py, this.dx, this.dy, this.spd, this.size, this.cr, this.cg, this.cb,
+                 this.ph, this.kind];
+    this.triBuf = new Float32Array(MAX_TRI * 3 * 6);
+    this.bubBuf = new Float32Array(MAX_TRI * 6 * 9);
+  }
+  amp() { return 0.006 + 0.11 * Math.pow(this.level, 1.2); }
+  buildTable() {
+    const a = this.amp(), T = this.tab;
+    for (let i = 0; i < TAB_N; i++) {
+      const g = -Math.PI + 2 * Math.PI * i / TAB_N;
+      let main = 0, echo = 0;
+      for (let j = 0; j < WAVES.length; j++) {
+        const [k, am] = WAVES[j];
+        main += am * Math.sin(k * g + this.phase[j]);
+        echo += am * Math.sin(k * g + this.phase[j] + 0.6 * (j + 1));
+      }
+      T[i] = this.r0 * (1 + a * main);
+      T[TAB_N + i] = this.r0 * (1 + 0.02 + 0.07 * this.level + 0.8 * a * echo);
+    }
+  }
+  radius(t) {
+    const u = (t + Math.PI) / (2 * Math.PI) * TAB_N, f0 = Math.floor(u), f = u - f0;
+    const i = ((f0 % TAB_N) + TAB_N) % TAB_N, j = (i + 1) % TAB_N;
+    return this.tab[i] * (1 - f) + this.tab[j] * f;
+  }
+  add(x, y, dx, dy, spd, size, col, kind) {
+    const i = this.n;
+    if (i >= MAX_TRI) return;
+    this.px[i] = x; this.py[i] = y; this.dx[i] = dx; this.dy[i] = dy; this.spd[i] = spd; this.size[i] = size;
+    this.cr[i] = col[0]; this.cg[i] = col[1]; this.cb[i] = col[2]; this.kind[i] = kind;
+    this.ph[i] = rnd(0, 2 * Math.PI);
+    this.n++;
+  }
+  update(dt, audio, down, up, cpu, ram, w, h) {
+    this.time += dt;
+    this.level += (audio - this.level) * (1 - Math.exp(-dt / (audio > this.level ? 0.03 : 0.25)));
+    for (let j = 0; j < WAVES.length; j++) this.phase[j] += WAVES[j][2] * (1 + 5 * this.level) * dt;
+    this.r0 = 0.30 * Math.min(w, h);
+    this.buildTable();
+    const halfDiag = Math.hypot(w, h) / 2 + 40;
+    const sc = this.sc = Math.min(w, h) / 800 * this.sizeMul;
+
+    // impulsi interni (CPU/RAM)
+    // CPU = velocità dell'effetto interno, RAM = luminosità (RAM 30%..90% -> 0..1)
+    const k = 1 - Math.exp(-dt / 0.3);
+    this.pin += (cpu - this.pin) * k;
+    this.bri += (clamp((ram - 0.3) / 0.6, 0, 1) - this.bri) * k;
+    this.flow += dt * (0.3 + 1.7 * this.pin);
+    this.pulseTimer -= dt;
+    if (this.inner === "pulse" && this.pulseTimer <= 0 && this.pulses.length <= MAX_PULSES - 2) {
+      const st = 0.3 + 0.7 * this.bri, du = 1.1 - 0.4 * this.pin;     // battito "lub-dub"
+      this.pulses.push([0, st, du], [-0.22 / (du * 0.9), 0.6 * st, du * 0.9]);
+      this.pulseTimer = 1.5 - 0.9 * this.pin;
+    }
+    for (const p of this.pulses) { p[0] += dt / p[2]; if (p[0] >= 1) this.flash = Math.max(this.flash, p[1]); }
+    this.pulses = this.pulses.filter(p => p[0] < 1);
+    this.flash *= Math.exp(-dt / 0.12);
+
+    // triangoli/bolle in arrivo (download)
+    for (let n = poisson((3 + 3000 * Math.pow(down, 1.3)) * dt); n > 0; n--) {
+      const a = rnd(0, 2 * Math.PI), d0 = halfDiag + rnd(0, 60);
+      const x = Math.cos(a) * d0, y = Math.sin(a) * d0;
+      const ta = a + gauss(0.35), rr = this.radius(ta);
+      let vx = Math.cos(ta) * rr - x, vy = Math.sin(ta) * rr - y;
+      const l = Math.hypot(vx, vy);
+      this.add(x, y, vx / l, vy / l, (250 + 2200 * down) * rnd(0.75, 1.25), rnd(3, 11) * sc, pick(LIGHT), 0);
+    }
+    // in uscita (upload)
+    for (let n = poisson((3 + 2000 * Math.pow(up, 1.3)) * dt); n > 0; n--) {
+      const a = rnd(0, 2 * Math.PI), rr = this.radius(a), b = a + gauss(0.12);
+      this.add(Math.cos(a) * rr, Math.sin(a) * rr, Math.cos(b), Math.sin(b),
+               (150 + 1600 * up) * rnd(0.75, 1.25), rnd(3, 11) * sc, pick(BLUES), 1);
+    }
+    // movimento e rimozione (swap con l'ultimo: l'ordine non conta)
+    for (let i = 0; i < this.n;) {
+      const px = this.px[i] += this.dx[i] * this.spd[i] * dt, py = this.py[i] += this.dy[i] * this.spd[i] * dt;
+      const r = Math.hypot(px, py), ring = this.radius(Math.atan2(py, px));
+      const k = this.kind[i];
+      if ((k === 0 && r <= ring) || (k === 1 && r > halfDiag + 40)) {
+        const l = --this.n;
+        for (const a of this.arrs) a[i] = a[l];
+      } else { this.R[i] = r; this.RING[i] = ring; i++; }
+    }
+  }
+  // Triangoli: x, y, r, g, b, a per vertice. Con shape=bubbles restano triangoli solo quelli in uscita.
+  triangles() {
+    const out = this.triBuf, sc = this.sc, bub = this.shape === "bubbles";
+    let o = 0;
+    for (let i = 0; i < this.n; i++) {
+      const kind = this.kind[i];
+      if (bub && kind !== 1) continue;
+      let dx = this.dx[i], dy = this.dy[i];
+      const spd = this.spd[i], size = this.size[i], ph = this.ph[i];
+      // nuoto a serpentina (solo visivo)
+      const wOsc = 3.5 + 0.5 * Math.sin(ph * 3.1), amp = size * 1.6 + 2, arg = this.time * wOsc + ph;
+      const off = amp * Math.sin(arg);
+      const x = this.px[i] - dy * off, y = this.py[i] + dx * off;
+      const ang = Math.atan2(amp * wOsc * Math.cos(arg), Math.max(spd, 60)) * 0.9;
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      const ndx = dx * ca - dy * sa, ndy = dy * ca + dx * sa;           // d*cos + perp*sin
+      dx = ndx; dy = ndy;
+      const nx = -dy, ny = dx;
+      const L = size * 0.87 * (1 + spd / 1500), W = size;
+      const dist = (this.R[i] - this.RING[i]) / Math.max(sc, 0.1);
+      const alpha = kind === 1 ? clamp(dist / 40, 0, 1) : clamp(dist / 25 + 0.25, 0.25, 1);
+      const pts = [x + dx * L * 0.6, y + dy * L * 0.6,
+                   x - dx * L * 0.4 + nx * W / 2, y - dy * L * 0.4 + ny * W / 2,
+                   x - dx * L * 0.4 - nx * W / 2, y - dy * L * 0.4 - ny * W / 2];
+      for (let v = 0; v < 3; v++) {
+        out[o++] = pts[2 * v]; out[o++] = pts[2 * v + 1];
+        out[o++] = this.cr[i]; out[o++] = this.cg[i]; out[o++] = this.cb[i]; out[o++] = alpha;
+      }
+    }
+    return o;
+  }
+  // Bolle in arrivo: un quadrato (2 triangoli) ciascuna: x, y, u, v, r, g, b, a, raggio_px
+  bubbles() {
+    if (this.shape !== "bubbles") return 0;
+    const out = this.bubBuf, sc = this.sc;
+    const C = [-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1];
+    let o = 0;
+    for (let i = 0; i < this.n; i++) {
+      if (this.kind[i] !== 0) continue;
+      const size = this.size[i], rad = Math.max(size * 0.7 + 1, 2.2 * sc);
+      const wob = Math.sin(this.time * 4 + this.ph[i]) * size * 0.5;
+      const cx = this.px[i] - this.dy[i] * wob, cy = this.py[i] + this.dx[i] * wob;
+      const dist = (this.R[i] - this.RING[i]) / Math.max(sc, 0.1);
+      const alpha = clamp(dist / 25 + 0.25, 0.25, 1), mg = (rad + 1.5) / rad;
+      for (let v = 0; v < 6; v++) {
+        const u = C[2 * v] * mg, w = C[2 * v + 1] * mg;
+        out[o++] = cx + u * rad; out[o++] = cy + w * rad; out[o++] = u; out[o++] = w;
+        out[o++] = this.cr[i]; out[o++] = this.cg[i]; out[o++] = this.cb[i]; out[o++] = alpha; out[o++] = rad;
+      }
+    }
+    return o;
+  }
+  pulseUniform() {
+    const out = new Float32Array(MAX_PULSES * 2);
+    this.pulses.filter(p => p[0] >= 0).slice(0, MAX_PULSES).forEach((p, i) => {
+      out[2 * i] = Math.pow(p[0], 0.8); out[2 * i + 1] = p[1] * (1 - 0.6 * p[0]);
+    });
+    return out;
+  }
+}
+
+// ------------------------------------------------------------------ shader (GLSL ES 3.00)
+const HEAD = "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n";
+const RING_VS = HEAD + `
+uniform vec2 u_res;
+uniform float u_half;
+layout(location=0) in vec2 in_pos;
+void main(){ gl_Position = vec4(in_pos * u_half / (0.5 * u_res), 0.0, 1.0); }`;
+const RING_FS = HEAD + `
+uniform vec2  u_res;
+uniform float u_level, u_flash, u_sc;
+uniform sampler2D u_tab;
+uniform vec3  u_core, u_glow, u_halo, u_echo, u_pcol, u_liq;
+uniform vec2  u_pulse[6];
+uniform float u_liquid, u_flow, u_energy, u_r0;
+out vec4 frag;
+const int N = 512;
+const float PI = 3.14159265;
+
+float tab(float u, int row){
+    int i0 = int(floor(u));
+    float f = u - float(i0);
+    i0 = i0 % N;
+    int i1 = (i0 + 1) % N;
+    return mix(texelFetch(u_tab, ivec2(i0, row), 0).r,
+               texelFetch(u_tab, ivec2(i1, row), 0).r, f);
+}
+void main(){
+    vec2 p = gl_FragCoord.xy - 0.5 * u_res;
+    float r = length(p);
+    float u = (atan(p.y, p.x) + PI) / (2.0 * PI) * float(N);
+    float R = tab(u, 0);
+    float d = r - R;
+
+    float w = (1.8 + 2.6 * u_level) * u_sc;
+    float core = 1.0 - smoothstep(w - 1.0, w + 1.0, abs(d));
+    float near = 0.0, far = 0.0;
+    if (d > 0.0) {
+        near = 0.80 * exp(-d / ((14.0 + 40.0 * u_level) * u_sc));
+        far  = 0.42 * exp(-d / ((60.0 + 120.0 * u_level) * u_sc));
+    } else {
+        near = 0.35 * exp(d / (3.0 * u_sc));
+    }
+    float echo = (1.0 - smoothstep(0.3, 1.6, abs(r - tab(u, 1)))) * (0.25 + 0.4 * u_level);
+
+    float pul = 0.0;
+    vec3 liq = vec3(0.0);
+    if (d < 0.0 && u_liquid < 0.5) {
+        float rho = r / R;
+        for (int i = 0; i < 6; i++) {
+            float x = (rho - u_pulse[i].x) / 0.09;
+            pul += u_pulse[i].y * exp(-x * x);
+        }
+        pul *= 0.55;
+    }
+    if (d < 0.0 && u_liquid > 0.5) {
+        vec2 wv = p / u_r0;
+        for (int i = 0; i < 3; i++)
+            wv += 0.5 * vec2(sin(wv.y * 2.2 + u_flow + float(i) * 1.7),
+                             cos(wv.x * 2.0 - 0.8 * u_flow + float(i) * 2.3));
+        float v = 0.6 * (0.5 + 0.5 * sin(3.0 * wv.x + 2.0 * wv.y + 0.7 * u_flow))
+                + 0.4 * (0.5 + 0.5 * sin(4.0 * length(wv) - 1.3 * u_flow));
+        v = smoothstep(0.15, 0.95, v);
+        float z = sqrt(max(0.0, 1.0 - (r / R) * (r / R)));
+        vec3 n = normalize(vec3(p / R, z));
+        float spec = pow(max(dot(n, normalize(vec3(-0.45, 0.55, 0.7))), 0.0), 28.0);
+        float k = 0.25 + 0.75 * u_energy;
+        liq = mix(u_liq * 0.22, u_liq * 1.25, v) * (0.35 + 0.65 * z) * k
+            + mix(vec3(1.0), u_liq, 0.35) * spec * (0.25 + 0.5 * u_energy);
+    }
+    float f = 1.0 + 1.2 * u_flash;
+    float fg = 1.0 + 0.35 * u_flash;
+    vec3 col = core * f * mix(u_core, vec3(0.93, 0.93, 0.94), min(1.0, u_level + 0.5 * u_flash))
+             + near * fg * u_glow + far * fg * u_halo + echo * u_echo + pul * u_pcol + liq;
+    frag = vec4(min(col, vec3(1.0)), 1.0);
+}`;
+const TRI_VS = HEAD + `
+uniform vec2 u_res;
+layout(location=0) in vec2 in_pos;
+layout(location=1) in vec4 in_col;
+out vec4 v_col;
+out vec3 v_bary;
+void main(){
+    gl_Position = vec4(in_pos / (0.5 * u_res), 0.0, 1.0);
+    v_col = in_col;
+    int k = gl_VertexID % 3;
+    v_bary = vec3(float(k == 0), float(k == 1), float(k == 2));
+}`;
+const TRI_FS = HEAD + `
+uniform float u_feather;
+in vec4 v_col;
+in vec3 v_bary;
+out vec4 frag;
+void main(){
+    float m  = min(min(v_bary.x, v_bary.y), v_bary.z);
+    float fw = max(fwidth(m), 1e-6);
+    float dist_px = m / fw;
+    float F = min(u_feather, 0.6 * (1.0 / 3.0) / fw);
+    float a = smoothstep(0.0, 1.0, clamp((dist_px + 0.35) / F, 0.0, 1.0));
+    frag = vec4(v_col.rgb, v_col.a * a);
+}`;
+const BUB_VS = HEAD + `
+uniform vec2 u_res;
+layout(location=0) in vec2 in_pos;
+layout(location=1) in vec2 in_uv;
+layout(location=2) in vec4 in_col;
+layout(location=3) in float in_rad;
+out vec2 v_uv;
+out vec4 v_col;
+out float v_rad;
+void main(){
+    gl_Position = vec4(in_pos / (0.5 * u_res), 0.0, 1.0);
+    v_uv = in_uv; v_col = in_col; v_rad = in_rad;
+}`;
+const BUB_FS = HEAD + `
+uniform float u_feather;
+in vec2 v_uv;
+in vec4 v_col;
+in float v_rad;
+out vec4 frag;
+void main(){
+    float r  = length(v_uv);
+    float fe = min(0.9, u_feather / v_rad);
+    float edge = 1.0 - smoothstep(1.0 - fe, 1.0, r);
+    float rim  = smoothstep(0.45, 0.97, r);
+    float hl   = 1.0 - smoothstep(0.0, 0.34, length(v_uv - vec2(-0.36, 0.38)));
+    vec3  rgb  = v_col.rgb * (0.40 + 0.60 * rim) + vec3(1.0) * hl * 0.85;
+    float a    = edge * v_col.a * clamp(0.14 + 0.62 * rim + 0.85 * hl, 0.0, 1.0);
+    frag = vec4(rgb, a);
+}`;
+
+// ------------------------------------------------------------------ rendering
+class Renderer {
+  constructor(canvas) {
+    const gl = this.gl = canvas.getContext("webgl2", { alpha: false, antialias: false, powerPreference: "high-performance" });
+    if (!gl) throw new Error("WebGL2 non disponibile in questo browser");
+    const mk = (vs, fs) => {
+      const p = gl.createProgram();
+      for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+        const sh = gl.createShader(t); gl.shaderSource(sh, s); gl.compileShader(sh);
+        if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+        gl.attachShader(p, sh);
+      }
+      gl.linkProgram(p);
+      if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+      const cache = {};
+      p.u = n => cache[n] ?? (cache[n] = gl.getUniformLocation(p, n));
+      return p;
+    };
+    this.ring = mk(RING_VS, RING_FS); this.tri = mk(TRI_VS, TRI_FS); this.bub = mk(BUB_VS, BUB_FS);
+    // vao: [buffer, [(location, componenti)...], byte per vertice]
+    const vao = (bytes, attrs) => {
+      const v = gl.createVertexArray(), b = gl.createBuffer(), stride = attrs.reduce((s, a) => s + a, 0) * 4;
+      gl.bindVertexArray(v); gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      gl.bufferData(gl.ARRAY_BUFFER, bytes, gl.DYNAMIC_DRAW);
+      let off = 0;
+      attrs.forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, stride, off); off += n * 4; });
+      return { v, b };
+    };
+    this.quad = vao(new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), [2]);
+    this.triV = vao(MAX_TRI * 3 * 6 * 4, [2, 4]);
+    this.bubV = vao(MAX_TRI * 6 * 9 * 4, [2, 2, 4, 1]);
+    this.tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    for (const [k, val] of [[gl.TEXTURE_MIN_FILTER, gl.NEAREST], [gl.TEXTURE_MAG_FILTER, gl.NEAREST],
+                            [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]])
+      gl.texParameteri(gl.TEXTURE_2D, k, val);
+  }
+  draw(s, w, h) {
+    const gl = this.gl;
+    gl.viewport(0, 0, w, h);
+    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.disable(gl.BLEND);
+    const sc = Math.min(w, h) / 800, r = this.ring;
+    gl.useProgram(r);
+    gl.uniform2f(r.u("u_res"), w, h);
+    gl.uniform1f(r.u("u_half"), s.r0 * 1.3 + 580 * sc);
+    gl.uniform1f(r.u("u_sc"), sc);
+    gl.uniform1f(r.u("u_level"), s.level);
+    gl.uniform1f(r.u("u_flash"), s.flash);
+    gl.uniform3fv(r.u("u_core"), RING_CORE); gl.uniform3fv(r.u("u_glow"), RING_GLOW);
+    gl.uniform3fv(r.u("u_halo"), RING_HALO); gl.uniform3fv(r.u("u_echo"), RING_ECHO);
+    gl.uniform3fv(r.u("u_pcol"), PULSE_COL); gl.uniform3fv(r.u("u_liq"), s.liq);
+    gl.uniform2fv(r.u("u_pulse[0]"), s.pulseUniform());
+    gl.uniform1f(r.u("u_liquid"), s.inner === "liquid" ? 1 : 0);
+    gl.uniform1f(r.u("u_flow"), s.flow); gl.uniform1f(r.u("u_energy"), s.bri); gl.uniform1f(r.u("u_r0"), s.r0);
+    gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, TAB_N, 2, 0, gl.RED, gl.FLOAT, s.tab);
+    gl.uniform1i(r.u("u_tab"), 0);
+    gl.bindVertexArray(this.quad.v);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    const nt = s.triangles();
+    if (nt) {
+      gl.useProgram(this.tri);
+      gl.uniform2f(this.tri.u("u_res"), w, h); gl.uniform1f(this.tri.u("u_feather"), 1.5 * sc);
+      gl.bindVertexArray(this.triV.v); gl.bindBuffer(gl.ARRAY_BUFFER, this.triV.b);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, s.triBuf, 0, nt);
+      gl.drawArrays(gl.TRIANGLES, 0, nt / 6);
+    }
+    const nb = s.bubbles();
+    if (nb) {
+      gl.useProgram(this.bub);
+      gl.uniform2f(this.bub.u("u_res"), w, h); gl.uniform1f(this.bub.u("u_feather"), 1.5 * sc);
+      gl.bindVertexArray(this.bubV.v); gl.bindBuffer(gl.ARRAY_BUFFER, this.bubV.b);
+      gl.bufferSubData(gl.ARRAY_BUFFER, 0, s.bubBuf, 0, nb);
+      gl.drawArrays(gl.TRIANGLES, 0, nb / 9);
+    }
+  }
+}
+
+// ------------------------------------------------------------------ segnali e ciclo principale
+const P = new URLSearchParams(location.search);
+const sig = { audio: 0, down_mbps: 0, up_mbps: 0, cpu: 0, ram: 0, audio_status: "in avvio", source: "?" };
+const demoSig = t => {
+  const burst = Math.pow(Math.max(0, Math.sin(t * 0.7)), 2);
+  return { audio: Math.min(1, 0.08 + 0.9 * burst * (0.6 + 0.4 * Math.pow(Math.sin(t * 9), 2))),
+           down_mbps: 200 * Math.pow(Math.max(0, Math.sin(t * 0.37 + 1)), 3),
+           up_mbps: 80 * Math.pow(Math.max(0, Math.sin(t * 0.53 + 3)), 3),
+           cpu: 0.5 + 0.5 * Math.sin(t * 0.3), ram: 0.55 + 0.2 * Math.sin(t * 0.1), audio_status: "DEMO" };
+};
+
+(async () => {
+  // Servita da un altro web server (porta 80), la pagina cerca i segnali su :8765 (o ?server=http://host:porta)
+  let SRV = null, d;
+  for (const base of [P.get("server"), "", `${location.protocol}//${location.hostname}:8765`]) {
+    if (base === null) continue;
+    try { const r = await fetch(base + "/config.json"); if (r.ok) { d = await r.json(); SRV = base; break; } } catch (e) { /* prossimo */ }
+  }
+  if (SRV === null) throw new Error("server dei segnali non raggiungibile: avvia ./run_web.sh");
+  const g = k => P.get(k) ?? d[k];
+  const maxMbps = parseFloat(g("max_mbps"));
+  const lc = g("liquid_color").replace("#", "");
+  if (!/^[0-9a-fA-F]{6}$/.test(lc)) throw new Error("liquid_color non valido: servono 6 cifre esadecimali");
+  const canvas = document.getElementById("c");
+  const rend = new Renderer(canvas);
+  const scene = new Scene(parseFloat(g("tri_size")), g("shape"), g("inner"), hex(lc));
+  let demo = P.has("demo"), audioSrc = g("audio_source"), es;
+
+  const connect = () => {
+    if (es) es.close();
+    es = new EventSource(SRV + "/events?audio_source=" + audioSrc);
+    es.onmessage = e => Object.assign(sig, JSON.parse(e.data));
+    es.onerror = () => { sig.audio = 0; sig.audio_status = "server non raggiungibile"; };
+  };
+  connect();
+
+  addEventListener("keydown", e => {
+    const k = e.key.toLowerCase();
+    if (k === "f") toggleFull();
+    else if (k === "d") demo = !demo;
+    else if (k === "a") { audioSrc = (sig.source === "bridge") ? "loopback" : "bridge"; connect(); }
+  });
+  const toggleFull = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+  addEventListener("dblclick", toggleFull);
+
+  const t0 = performance.now() / 1000; let last = t0, lastTitle = 0;
+  const frame = () => {
+    requestAnimationFrame(frame);
+    const now = performance.now() / 1000, dt = Math.min(now - last, 0.1);
+    last = now;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
+    const s = demo ? demoSig(now - t0) : sig;
+    scene.update(dt, s.audio, netNorm(s.down_mbps, maxMbps), netNorm(s.up_mbps, maxMbps), s.cpu, s.ram, w, h);
+    rend.draw(scene, w, h);
+    if (now - lastTitle > 0.5) {
+      lastTitle = now;
+      document.title = `audio ${s.audio.toFixed(2)} | ↓ ${s.down_mbps.toFixed(1)} ↑ ${s.up_mbps.toFixed(1)} Mbit/s` +
+        ` | CPU ${Math.round(s.cpu * 100)}% RAM ${Math.round(s.ram * 100)}% | ${scene.n} tri | ${s.audio_status}`;
+    }
+  };
+  frame();
+})().catch(e => { document.body.insertAdjacentHTML("beforeend", `<pre style="color:#f66;position:fixed;top:0;margin:1em">${e.message}</pre>`); });
+</script>
+</body>
+</html>
