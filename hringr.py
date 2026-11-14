@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Daniele "DLx" Lussana
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Cerchio che vibra con l'audio + triangoli guidati dalla rete + impulso guidato dalla CPU.
 
 - Il perimetro di un cerchio vibra come attraverso l'acqua: più l'audio in uscita
@@ -189,7 +191,7 @@ class Scene:
         self.phase = np.zeros(len(WAVES), np.float32)
         self.level = 0.0
         self.pin = 0.0                    # CPU smussata: velocità dell'effetto interno
-        self.bri = 0.0                    # RAM smussata (30%..90% -> 0..1): luminosità dell'effetto interno
+        self.bri = 0.0                    # RAM smussata (40%..85% -> 0..1): luminosità dell'effetto interno
         self.pulses = []                  # [età normalizzata 0..1, forza, durata s]
         self.pulse_timer = 0.0
         self.flash = 0.0                  # lampo del perimetro quando arriva un impulso
@@ -250,8 +252,8 @@ class Scene:
         # --- impulsi interni (CPU/RAM)
         k = 1 - math.exp(-dt / 0.3)
         self.pin += (cpu - self.pin) * k
-        self.bri += (min(1.0, max(0.0, (ram - 0.3) / 0.6)) - self.bri) * k
-        self.flow += dt * (0.3 + 1.7 * self.pin)
+        self.bri += (min(1.0, max(0.0, (ram - 0.4) / 0.45)) - self.bri) * k
+        self.flow += dt * (0.15 + 3.0 * self.pin * self.pin)
         self.pulse_timer -= dt
         if self.inner == "pulse" and self.pulse_timer <= 0 and len(self.pulses) <= MAX_PULSES - 2:
             # battito "lub-dub": un impulso forte e, poco dopo, uno più debole; poi pausa
@@ -444,9 +446,9 @@ void main(){
         float z = sqrt(max(0.0, 1.0 - (r / R) * (r / R)));            // centro in rilievo, bordo scuro
         vec3 n = normalize(vec3(p / R, z));
         float spec = pow(max(dot(n, normalize(vec3(-0.45, 0.55, 0.7))), 0.0), 28.0);
-        float k = 0.25 + 0.75 * u_energy;                              // CPU: più carica = più luminoso
+        float k = 0.10 + 0.90 * u_energy;                              // CPU: più carica = più luminoso
         liq = mix(u_liq * 0.22, u_liq * 1.25, v) * (0.35 + 0.65 * z) * k
-            + mix(vec3(1.0), u_liq, 0.35) * spec * (0.25 + 0.5 * u_energy);
+            + mix(vec3(1.0), u_liq, 0.35) * spec * (0.10 + 0.70 * u_energy);
     }
     float f = 1.0 + 1.2 * u_flash;
     float fg = 1.0 + 0.35 * u_flash;   // l'alone reagisce al lampo meno del bordo (evita il ciano saturo)

@@ -30,3 +30,5 @@ I valori predefiniti sono in `config.ini`; riga di comando (desktop) o parametri
 ## License / Licenza
 
 [GNU AGPL-3.0](LICENSE)
+
+Copyright (C) 2026 Daniele "DLx" Lussana

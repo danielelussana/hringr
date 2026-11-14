@@ -1,4 +1,8 @@
 <!doctype html>
+<!--
+Copyright (C) 2026 Daniele "DLx" Lussana
+SPDX-License-Identifier: AGPL-3.0-or-later
+-->
 <html lang="it">
 <head>
 <meta charset="utf-8">
@@ -88,11 +92,11 @@ class Scene {
     const sc = this.sc = Math.min(w, h) / 800 * this.sizeMul;
 
     // impulsi interni (CPU/RAM)
-    // CPU = velocità dell'effetto interno, RAM = luminosità (RAM 30%..90% -> 0..1)
+    // CPU = velocità dell'effetto interno (quadratica: stacca di più tra scarico e carico), RAM = luminosità (RAM 40%..85% -> 0..1)
     const k = 1 - Math.exp(-dt / 0.3);
     this.pin += (cpu - this.pin) * k;
-    this.bri += (clamp((ram - 0.3) / 0.6, 0, 1) - this.bri) * k;
-    this.flow += dt * (0.3 + 1.7 * this.pin);
+    this.bri += (clamp((ram - 0.4) / 0.45, 0, 1) - this.bri) * k;
+    this.flow += dt * (0.15 + 3.0 * this.pin * this.pin);
     this.pulseTimer -= dt;
     if (this.inner === "pulse" && this.pulseTimer <= 0 && this.pulses.length <= MAX_PULSES - 2) {
       const st = 0.3 + 0.7 * this.bri, du = 1.1 - 0.4 * this.pin;     // battito "lub-dub"
@@ -255,9 +259,9 @@ void main(){
         float z = sqrt(max(0.0, 1.0 - (r / R) * (r / R)));
         vec3 n = normalize(vec3(p / R, z));
         float spec = pow(max(dot(n, normalize(vec3(-0.45, 0.55, 0.7))), 0.0), 28.0);
-        float k = 0.25 + 0.75 * u_energy;
+        float k = 0.10 + 0.90 * u_energy;
         liq = mix(u_liq * 0.22, u_liq * 1.25, v) * (0.35 + 0.65 * z) * k
-            + mix(vec3(1.0), u_liq, 0.35) * spec * (0.25 + 0.5 * u_energy);
+            + mix(vec3(1.0), u_liq, 0.35) * spec * (0.10 + 0.70 * u_energy);
     }
     float f = 1.0 + 1.2 * u_flash;
     float fg = 1.0 + 0.35 * u_flash;

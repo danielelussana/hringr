@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright (C) 2026 Daniele "DLx" Lussana
+# SPDX-License-Identifier: AGPL-3.0-or-later
 """Versione web di hringr.py: serve hringr.html e i segnali (CPU, RAM, rete, audio) via SSE.
 
 Il disegno gira nel browser (WebGL2); qui girano solo le misure, che un browser non può leggere.
