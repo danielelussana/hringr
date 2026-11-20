@@ -22,6 +22,7 @@ Tasti: F schermo intero, D demo on/off, ESC o Q esce.
 """
 import argparse
 import configparser
+import json
 import math
 import threading
 import time
@@ -34,6 +35,13 @@ def _hex(h):
     return tuple(int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
 
 
+def _positive(s):
+    v = float(s)
+    if not v > 0:
+        raise argparse.ArgumentTypeError(f"deve essere maggiore di 0 (trovato '{s}')")
+    return v
+
+
 def _color(s):
     s = s.strip().lstrip("#")
     if len(s) != 6:
@@ -41,22 +49,27 @@ def _color(s):
             f"colore non valido '{s}': servono 6 cifre esadecimali (RRGGBB); nel config.ini scrivere senza '#'")
     return _hex(s)
 
-# Colori presi dall'immagine di riferimento (RGB 0..1)
-LIGHT = [_hex(h) for h in ("E8E8EA", "C9D8E8", "A7C4E5")]   # triangoli in arrivo
-BLUES = [_hex(h) for h in ("4399D3", "0083C8", "006CA8")]   # triangoli in uscita
-RING_CORE, RING_GLOW, RING_ECHO = _hex("C9D8E8"), _hex("0083C8"), _hex("4399D3")
-RING_HALO = _hex("006CA8")
-PULSE_COL = _hex("0083C8")
+# Costanti condivise con la versione web (che le riceve da hringr_web.py in /config.json).
+PARAMS = json.loads((Path(__file__).resolve().parent / "params.json").read_text())
+LIGHT = [_hex(h) for h in PARAMS["light"]]            # triangoli in arrivo
+BLUES = [_hex(h) for h in PARAMS["blues"]]            # triangoli in uscita
+RING_CORE, RING_GLOW, RING_ECHO = (_hex(PARAMS[k]) for k in ("ring_core", "ring_glow", "ring_echo"))
+RING_HALO, PULSE_COL = _hex(PARAMS["ring_halo"]), _hex(PARAMS["pulse_col"])
 
 # Onde che deformano il perimetro: (lobi, ampiezza relativa, velocità base rad/s)
-WAVES = [(3, 0.55, 0.9), (5, 0.30, -1.4), (8, 0.20, 2.2), (13, 0.12, -3.5), (21, 0.07, 5.5)]
+WAVES = [tuple(w) for w in PARAMS["waves"]]
 WK = np.array([w[0] for w in WAVES], np.float32)
 WA = np.array([w[1] for w in WAVES], np.float32)
 WS = np.array([w[2] for w in WAVES], np.float32)
 
-TAB_N = 512                       # campioni angolari della tabella del perimetro
+TAB_N = PARAMS["tab_n"]           # campioni angolari della tabella del perimetro
 GRID = np.linspace(-np.pi, np.pi, TAB_N, endpoint=False).astype(np.float32)
-MAX_PULSES = 6
+MAX_PULSES = PARAMS["max_pulses"]
+
+# Valori predefiniti, unica fonte per hringr.py (argparse) e hringr_web.py.
+DEFAULTS = {"shape": "triangles", "inner": "pulse", "liquid_color": "0083C8", "audio_source": "auto",
+            "bridge_url": "http://127.0.0.1:44883/bars", "bridge_scale": 22.0,
+            "max_mbps": 200.0, "tri_size": 1.0}
 
 
 # ----------------------------------------------------------------------------- segnali
@@ -133,35 +146,53 @@ def bridge_available(url):
         return False
 
 
+def read_net(path="/proc/net/dev"):
+    """(byte ricevuti, byte inviati) sommati su tutte le interfacce tranne il loopback."""
+    rx = tx = 0
+    for line in Path(path).read_text().splitlines()[2:]:
+        name, _, data = line.partition(":")
+        if name.strip().startswith("lo"):
+            continue
+        f = data.split()
+        rx, tx = rx + int(f[0]), tx + int(f[8])
+    return rx, tx
+
+
+def read_cpu(path="/proc/stat"):
+    """(tempo totale, tempo inattivo) in tick, dalla riga 'cpu' aggregata."""
+    f = [int(x) for x in Path(path).read_text().splitlines()[0].split()[1:]]
+    return sum(f[:8]), f[3] + f[4]            # idle + iowait
+
+
+def read_ram(path="/proc/meminfo"):
+    """Frazione di RAM in uso 0..1 (come psutil: 1 - disponibile/totale)."""
+    m = {}
+    for line in Path(path).read_text().splitlines():
+        k, _, v = line.partition(":")
+        m[k] = int(v.split()[0])
+    return 1.0 - m["MemAvailable"] / m["MemTotal"]
+
+
 def start_stats_thread(sig):
-    """Rete (download/upload), CPU e RAM, campionati 5 volte al secondo."""
-    import psutil
-
-    def counters():
-        rx = tx = 0
-        for name, c in psutil.net_io_counters(pernic=True).items():
-            if name.lower().startswith(("lo", "loopback")):
-                continue
-            rx += c.bytes_recv
-            tx += c.bytes_sent
-        return rx, tx
-
+    """Rete (download/upload), CPU e RAM, campionati 5 volte al secondo (da /proc: Linux)."""
     def run():
-        rx0, tx0 = counters()
+        rx0, tx0 = read_net()
+        c0 = read_cpu()
         t0 = time.time()
-        psutil.cpu_percent(None)
         while True:
             time.sleep(0.2)
-            rx1, tx1 = counters()
+            rx1, tx1 = read_net()
+            c1 = read_cpu()
             t1 = time.time()
             dt = t1 - t0
             d = max(0, rx1 - rx0) * 8 / 1e6 / dt
             u = max(0, tx1 - tx0) * 8 / 1e6 / dt
             sig.down_mbps += (d - sig.down_mbps) * 0.5
             sig.up_mbps += (u - sig.up_mbps) * 0.5
-            sig.cpu = psutil.cpu_percent(None) / 100.0
-            sig.ram = psutil.virtual_memory().percent / 100.0
-            rx0, tx0, t0 = rx1, tx1, t1
+            dtot = c1[0] - c0[0]
+            sig.cpu = min(1.0, max(0.0, 1.0 - (c1[1] - c0[1]) / dtot)) if dtot > 0 else sig.cpu
+            sig.ram = read_ram()
+            rx0, tx0, c0, t0 = rx1, tx1, c1, t1
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -181,7 +212,7 @@ def net_norm(mbps, max_mbps):
 
 # ----------------------------------------------------------------------------- scena
 class Scene:
-    MAX_TRI = 12000
+    MAX_TRI = PARAMS["max_tri"]
 
     def __init__(self, seed=None, size_mul=1.0, shape="triangles", inner="pulse", liquid_color=None):
         self.rng = np.random.default_rng(seed)
@@ -599,10 +630,9 @@ def _wl_connect():
     return sk
 
 
-def terminal_output():
-    """Wayland (wlroots/labwc): restituisce (nome, larghezza, altezza) dell'output su cui si trova la
-    finestra attiva, cioè il terminale da cui si lancia il programma. None se non determinabile.
-    Parla il protocollo grezzo (wl_output + zwlr_foreign_toplevel_management_v1): nessuna dipendenza."""
+def _wl_snapshot():
+    """Parla il protocollo Wayland grezzo (wl_output + zwlr_foreign_toplevel_management_v1: nessuna
+    dipendenza) e restituisce (outs, tops, order): output, finestre e ordine degli output. None se non possibile."""
     import struct
     try:
         sk = _wl_connect()
@@ -707,32 +737,50 @@ def terminal_output():
             send(1, 0, struct.pack("<I", cb))
             if not pump(cb):
                 return None
-        act = [t for t in tops.values() if t["active"] and t["outs"]]
-        if not act:
-            return None
-        oid = act[0]["outs"][0]
-        od = outs.get(oid)
-        if not od or not od["mode"]:
-            return None
-        w, h = od["mode"]
-        if od["tr"] in (1, 3, 5, 7):
-            w, h = h, w
-        sc = max(od["scale"], 1)
-        return od["name"], w // sc, h // sc, order.index(oid)
+        return outs, tops, order
     except (OSError, struct.error):
         return None
     finally:
         sk.close()
 
 
+def terminal_output():
+    """Wayland (wlroots/labwc): (nome, larghezza, altezza, indice) dell'output su cui si trova la
+    finestra attiva, cioè il terminale da cui si lancia il programma. None se non determinabile."""
+    snap = _wl_snapshot()
+    if not snap:
+        return None
+    outs, tops, order = snap
+    act = [t for t in tops.values() if t["active"] and t["outs"]]
+    if not act:
+        return None
+    oid = act[0]["outs"][0]
+    od = outs.get(oid)
+    if not od or not od["mode"]:
+        return None
+    w, h = od["mode"]
+    if od["tr"] in (1, 3, 5, 7):
+        w, h = h, w
+    sc = max(od["scale"], 1)
+    return od["name"], w // sc, h // sc, order.index(oid)
+
+
 # ----------------------------------------------------------------------------- main
+def read_config(path):
+    """config.ini + config.local.ini (stessa cartella, non tracciato da git: impostazioni di questa macchina)."""
+    path = Path(path)
+    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    cp.read([path, path.with_name(f"{path.stem}.local{path.suffix}")])
+    return cp
+
+
 def load_config(ap):
     """Legge [hringr] da config.ini e lo usa come valori predefiniti degli argomenti."""
     pre = argparse.ArgumentParser(add_help=False)      # solo --config, così --help vede i valori del file
     pre.add_argument("--config", default=ap.get_default("config"))
     path = pre.parse_known_args()[0].config
-    cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
-    if not cp.read(path) or not cp.has_section("hringr"):
+    cp = read_config(path)
+    if not cp.has_section("hringr"):
         return
     defaults = {}
     for key, raw in cp.items("hringr"):
@@ -768,25 +816,25 @@ def main():
     ap.add_argument("-h", "--help", action="help", help="mostra questo aiuto ed esce")
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.ini")),
                     help="file di configurazione (valori predefiniti; la riga di comando prevale)")
-    ap.add_argument("--shape", choices=("triangles", "bubbles"), default="triangles",
+    ap.add_argument("--shape", choices=("triangles", "bubbles"), default=DEFAULTS["shape"],
                     help="forma di ciò che si dirige verso il cerchio: triangoli o bolle")
-    ap.add_argument("--inner", choices=("pulse", "liquid"), default="pulse",
+    ap.add_argument("--inner", choices=("pulse", "liquid"), default=DEFAULTS["inner"],
                     help="effetto dentro il cerchio: pulse = battito ad anelli, liquid = liquido che si muove")
-    ap.add_argument("--liquid-color", type=_color, default="0083C8",
+    ap.add_argument("--liquid-color", type=_color, default=DEFAULTS["liquid_color"],
                     help="colore del liquido, esadecimale RRGGBB (nel config.ini scrivere senza '#')")
     ap.add_argument("--demo", action="store_true", help="segnali simulati")
     ap.add_argument("--fullscreen", action="store_true", help="schermo intero (si può alternare con il tasto F)")
-    ap.add_argument("--audio-source", choices=("auto", "bridge", "loopback"), default="auto",
+    ap.add_argument("--audio-source", choices=("auto", "bridge", "loopback"), default=DEFAULTS["audio_source"],
                     help="bridge = barre di cava da mpd-spectrum (nessun conflitto con MPD); "
                          "loopback = cattura diretta dalla scheda; auto = bridge se raggiungibile")
-    ap.add_argument("--bridge-url", default="http://127.0.0.1:44883/bars",
+    ap.add_argument("--bridge-url", default=DEFAULTS["bridge_url"],
                     help="indirizzo da cui leggere le barre di cava (mpd-spectrum)")
-    ap.add_argument("--bridge-scale", type=float, default=22.0,
+    ap.add_argument("--bridge-scale", type=_positive, default=DEFAULTS["bridge_scale"],
                     help="media delle barre (0-100) che corrisponde al livello massimo")
     ap.add_argument("--audio-device", default=None, help="parte del nome del dispositivo di cattura")
     ap.add_argument("--audio-gain", type=float, default=0.0, help="dB aggiunti al livello audio")
-    ap.add_argument("--max-mbps", type=float, default=200.0, help="Mbit/s = effetto massimo (scala log)")
-    ap.add_argument("--tri-size", type=float, default=1.0, help="moltiplicatore della dimensione dei triangoli")
+    ap.add_argument("--max-mbps", type=_positive, default=DEFAULTS["max_mbps"], help="Mbit/s = effetto massimo (scala log)")
+    ap.add_argument("--tri-size", type=_positive, default=DEFAULTS["tri_size"], help="moltiplicatore della dimensione dei triangoli")
     ap.add_argument("--display", default="auto",
                     help="monitor su cui aprire la finestra: auto = quello del terminale da cui si lancia "
                          "(Wayland/labwc), oppure l'indice 0, 1, ... nell'ordine di SDL")
@@ -843,14 +891,15 @@ def main():
     rend, (W, H) = open_window(full)
 
     sig = Signals()
-    demo = a.demo
-    if not demo:
-        use_bridge = a.audio_source == "bridge" or (a.audio_source == "auto" and bridge_available(a.bridge_url))
-        if use_bridge:
-            start_bridge_thread(sig, a.bridge_url, a.bridge_scale)
-        else:
-            start_audio_thread(sig, a.audio_device, a.audio_gain)
-        start_stats_thread(sig)
+    demo, dsig = a.demo, Signals()     # la demo ha segnali propri: i thread reali non la disturbano
+    # i thread partono sempre: con --demo il tasto D deve poter tornare ai dati reali
+    # (in demo i valori reali vengono sovrascritti a ogni frame)
+    use_bridge = a.audio_source == "bridge" or (a.audio_source == "auto" and bridge_available(a.bridge_url))
+    if use_bridge:
+        start_bridge_thread(sig, a.bridge_url, a.bridge_scale)
+    else:
+        start_audio_thread(sig, a.audio_device, a.audio_gain)
+    start_stats_thread(sig)
     scene = Scene(size_mul=a.tri_size, shape=a.shape, inner=a.inner, liquid_color=a.liquid_color)
     clock = pygame.time.Clock()
     t0 = last = last_cap = time.time()
@@ -873,9 +922,10 @@ def main():
         dt = min(now - last, 0.1)
         last = now
         if demo:
-            demo_signals(sig, now - t0)
-        scene.update(dt, sig.audio, net_norm(sig.down_mbps, a.max_mbps),
-                     net_norm(sig.up_mbps, a.max_mbps), sig.cpu, sig.ram, W, H)
+            demo_signals(dsig, now - t0)
+        s = dsig if demo else sig
+        scene.update(dt, s.audio, net_norm(s.down_mbps, a.max_mbps),
+                     net_norm(s.up_mbps, a.max_mbps), s.cpu, s.ram, W, H)
         rend.draw(scene, W, H)
         pygame.display.flip()
         clock.tick(60)
@@ -883,9 +933,9 @@ def main():
         if now - last_cap > 0.5:
             last_cap = now
             pygame.display.set_caption(
-                f"audio {sig.audio:.2f} | ↓ {sig.down_mbps:.1f} ↑ {sig.up_mbps:.1f} Mbit/s"
-                f" | CPU {sig.cpu:.0%} RAM {sig.ram:.0%} | {len(scene.pos)} tri"
-                f" | {sig.audio_status if not demo else 'DEMO'}")
+                f"audio {s.audio:.2f} | ↓ {s.down_mbps:.1f} ↑ {s.up_mbps:.1f} Mbit/s"
+                f" | CPU {s.cpu:.0%} RAM {s.ram:.0%} | {len(scene.pos)} tri"
+                f" | {'DEMO' if demo else sig.audio_status}")
     pygame.quit()
 
 

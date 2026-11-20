@@ -18,14 +18,16 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <canvas id="c"></canvas>
 <script>
 "use strict";
-// Port in WebGL2 di hringr.py: stesse costanti, stessa scena, stessi shader (GLSL ES 3.00).
+// Port in WebGL2 di hringr.py: costanti condivise (params.json), stessa scena, stessi shader (GLSL ES 3.00).
 const hex = h => [0, 2, 4].map(i => parseInt(h.substr(i, 2), 16) / 255);
-const LIGHT = ["E8E8EA", "C9D8E8", "A7C4E5"].map(hex);
-const BLUES = ["4399D3", "0083C8", "006CA8"].map(hex);
-const RING_CORE = hex("C9D8E8"), RING_GLOW = hex("0083C8"), RING_ECHO = hex("4399D3"),
-      RING_HALO = hex("006CA8"), PULSE_COL = hex("0083C8");
-const WAVES = [[3, .55, .9], [5, .30, -1.4], [8, .20, 2.2], [13, .12, -3.5], [21, .07, 5.5]];
-const TAB_N = 512, MAX_PULSES = 6, MAX_TRI = 12000;
+// Costanti condivise con hringr.py: arrivano dal server (params.json) in /config.json, vedi setParams().
+let LIGHT, BLUES, RING_CORE, RING_GLOW, RING_ECHO, RING_HALO, PULSE_COL, WAVES, TAB_N, MAX_PULSES, MAX_TRI;
+const setParams = p => {
+  [LIGHT, BLUES] = [p.light.map(hex), p.blues.map(hex)];
+  [RING_CORE, RING_GLOW, RING_ECHO, RING_HALO, PULSE_COL] =
+    ["ring_core", "ring_glow", "ring_echo", "ring_halo", "pulse_col"].map(k => hex(p[k]));
+  ({ waves: WAVES, tab_n: TAB_N, max_pulses: MAX_PULSES, max_tri: MAX_TRI } = p);
+};
 const clamp = (x, a, b) => Math.min(b, Math.max(a, x));
 const rnd = (a, b) => a + Math.random() * (b - a);
 const gauss = s => s * Math.sqrt(-2 * Math.log(1 - Math.random())) * Math.cos(2 * Math.PI * Math.random());
@@ -417,25 +419,29 @@ const demoSig = t => {
 };
 
 (async () => {
-  // Servita da un altro web server (porta 80), la pagina cerca i segnali su :8765 (o ?server=http://host:porta)
+  // Servita da un altro web server (porta 80), la pagina cerca i segnali su :8766 (o ?server=http://host:porta)
   let SRV = null, d;
-  for (const base of [P.get("server"), "", `${location.protocol}//${location.hostname}:8765`]) {
+  for (const base of [P.get("server"), "", `${location.protocol}//${location.hostname}:8766`]) {
     if (base === null) continue;
     try { const r = await fetch(base + "/config.json"); if (r.ok) { d = await r.json(); SRV = base; break; } } catch (e) { /* prossimo */ }
   }
   if (SRV === null) throw new Error("server dei segnali non raggiungibile: avvia ./run_web.sh");
+  setParams(d.params);
   const g = k => P.get(k) ?? d[k];
   const maxMbps = parseFloat(g("max_mbps"));
+  if (!(maxMbps > 0)) throw new Error("max_mbps deve essere maggiore di 0");
   const lc = g("liquid_color").replace("#", "");
   if (!/^[0-9a-fA-F]{6}$/.test(lc)) throw new Error("liquid_color non valido: servono 6 cifre esadecimali");
   const canvas = document.getElementById("c");
   const rend = new Renderer(canvas);
-  const scene = new Scene(parseFloat(g("tri_size")), g("shape"), g("inner"), hex(lc));
+  const triSize = parseFloat(g("tri_size"));
+  if (!(triSize > 0)) throw new Error("tri_size deve essere maggiore di 0");
+  const scene = new Scene(triSize, g("shape"), g("inner"), hex(lc));
   let demo = P.has("demo"), audioSrc = g("audio_source"), es;
 
   const connect = () => {
     if (es) es.close();
-    es = new EventSource(SRV + "/events?audio_source=" + audioSrc);
+    es = new EventSource(SRV + "/events?audio_source=" + encodeURIComponent(audioSrc));
     es.onmessage = e => Object.assign(sig, JSON.parse(e.data));
     es.onerror = () => { sig.audio = 0; sig.audio_status = "server non raggiungibile"; };
   };

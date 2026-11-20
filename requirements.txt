@@ -1,5 +1,4 @@
 numpy
 moderngl
 pygame
-psutil
 SoundCard
