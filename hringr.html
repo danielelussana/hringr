@@ -116,10 +116,10 @@ class Scene {
     const sc = this.sc = Math.min(w, h) / 800 * this.sizeMul;
 
     // impulsi interni (CPU/RAM)
-    // CPU = velocità dell'effetto interno (quadratica: stacca di più tra scarico e carico), RAM = luminosità (RAM 40%..85% -> 0..1)
+    // CPU = velocità dell'effetto interno (quadratica: stacca di più tra scarico e carico), RAM = luminosità (RAM 40%..76% -> 0..1)
     const k = 1 - Math.exp(-dt / 0.3);
     this.pin += (cpu - this.pin) * k;
-    this.bri += (clamp((ram - 0.4) / 0.45, 0, 1) - this.bri) * k;
+    this.bri += (clamp((ram - 0.4) / 0.36, 0, 1) - this.bri) * k;
     this.flow += dt * (0.15 + 3.0 * this.pin * this.pin);
     this.pulseTimer -= dt;
     if (this.inner === "pulse" && this.pulseTimer <= 0 && this.pulses.length <= MAX_PULSES - 2) {
@@ -302,10 +302,14 @@ void main(){
     float g = u_glitch, zone = 1.0 - smoothstep(1.2 * u_r0, 1.7 * u_r0, length(p));
     float slot = floor(u_time * 12.0), band = floor(gl_FragCoord.y / 14.0);
     float cut = step(1.0 - 0.7 * g, hash(vec2(band, slot)));
-    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 90.0 * u_sc * g;
-    vec3 c = shade(p) * (1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5));
-    float spark = zone * step(1.0 - 0.10 * g, hash(floor(gl_FragCoord.xy / 3.0) + floor(u_time * 30.0)));
-    c = min(c + spark * vec3(0.35, 0.9, 1.0) * g, vec3(1.0));
+    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 220.0 * u_sc * g;   // fette più larghe
+    // separazione dei canali: rosso spostato a destra, blu a sinistra (un solo campionamento se il glitch è debole)
+    float sep = zone * g * 5.0 * u_sc;
+    vec3 c = g > 0.01 ? vec3(shade(p + vec2(sep, 0.0)).r, shade(p).g, shade(p - vec2(sep, 0.0)).b) : shade(p);
+    c *= 1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5);
+    // linee orizzontali intere invece di puntini: righe che cambiano a scatti
+    float streak = zone * g * step(1.0 - 0.18 * g, hash(vec2(floor(gl_FragCoord.y / 2.0), floor(u_time * 18.0))));
+    c = min(c + streak * vec3(0.5, 0.9, 1.0) * 0.6, vec3(1.0));
     frag = vec4(c, max(max(c.r, c.g), c.b));  // trasparente dove non c'è anello
 }
 `;
@@ -479,7 +483,7 @@ const matchQ = (e, q) => q.trim().toLowerCase().split(/\s+/).filter(Boolean).eve
 
 class JournalView {
   constructor(cfg, src, scene) {
-    Object.assign(this, { cfg, scene, ev: [], lanes: new Map(), counts: Array(8).fill(0), status: "starting",
+    Object.assign(this, { cfg, scene, ev: [], lanes: new Map(), counts: Array(8).fill(0), status: "starting", kick: 0,
                           amt: 0, cv: document.getElementById("jr") });
     this.col = cfg.colors.map(hex);
     this.base = scene.liq.slice(); this.cur = this.base.slice(); this.kl = 0; this.kr = 0; this.mix = [];
@@ -499,7 +503,8 @@ class JournalView {
     this.counts = m.counts; this.status = m.status;
     const now = performance.now() / 1000;
     for (const e of m.ev) {
-      e.born = now;                                    // la timeline usa l'ora di arrivo nel browser
+      e.born = now;
+      if (e.p <= 3) this.kick = Math.min(1, this.kick + 0.8);   // errore nel log: impulso di glitch sull'anello                                    // la timeline usa l'ora di arrivo nel browser
       this.ev.push(e);
       const l = this.lanes.get(e.u) ?? { n: 0, last: 0 };
       l.n++; l.last = now; this.lanes.set(e.u, l);
@@ -514,6 +519,7 @@ class JournalView {
   update(dt) {
     // compromesso: il liquido risponde quasi subito (tau 0,25 s), l'anello un poco dopo (tau 0,7 s), il colore scivola (tau 0,2 s)
     this.amt *= Math.exp(-dt / 6);
+    this.kick *= Math.exp(-dt / 0.4);
     const target = Math.min(1, this.amt) * this.cfg.ring_tint, ease = t => 1 - Math.exp(-dt / t);
     this.kl += (target - this.kl) * ease(0.25);
     this.kr += (target - this.kr) * ease(0.7);
@@ -712,7 +718,7 @@ class JournalView {
     const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
     const s = demo ? demoSig(now - t0) : sig;
-    scene.update(dt, s.audio, netNorm(s.down_mbps, maxMbps), netNorm(s.up_mbps, maxMbps), s.cpu, s.ram, w, h, s.swap);
+    scene.update(dt, s.audio, netNorm(s.down_mbps, maxMbps), netNorm(s.up_mbps, maxMbps), s.cpu, s.ram, w, h, Math.max(s.swap, jv ? jv.kick : 0));
     if (jv) jv.update(dt);
     rend.draw(scene, w, h);
     if (jv) jv.draw(w, h);

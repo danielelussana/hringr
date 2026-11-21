@@ -247,7 +247,7 @@ class Scene:
         self.phase = np.zeros(len(WAVES), np.float32)
         self.level = 0.0
         self.pin = 0.0                    # CPU smussata: velocità dell'effetto interno
-        self.bri = 0.0                    # RAM smussata (40%..85% -> 0..1): luminosità dell'effetto interno
+        self.bri = 0.0                    # RAM smussata (40%..76% -> 0..1): luminosità dell'effetto interno
         self.glitch = 0.0                 # attività di swap smussata: intensità del glitch sull'anello
         self.pulses = []                  # [età normalizzata 0..1, forza, durata s]
         self.pulse_timer = 0.0
@@ -310,7 +310,7 @@ class Scene:
         # --- impulsi interni (CPU/RAM)
         k = 1 - math.exp(-dt / 0.3)
         self.pin += (cpu - self.pin) * k
-        self.bri += (min(1.0, max(0.0, (ram - 0.4) / 0.45)) - self.bri) * k
+        self.bri += (min(1.0, max(0.0, (ram - 0.4) / 0.36)) - self.bri) * k
         self.flow += dt * (0.15 + 3.0 * self.pin * self.pin)
         self.pulse_timer -= dt
         if self.inner == "pulse" and self.pulse_timer <= 0 and len(self.pulses) <= MAX_PULSES - 2:
@@ -524,10 +524,14 @@ void main(){
     float g = u_glitch, zone = 1.0 - smoothstep(1.2 * u_r0, 1.7 * u_r0, length(p));
     float slot = floor(u_time * 12.0), band = floor(gl_FragCoord.y / 14.0);
     float cut = step(1.0 - 0.7 * g, hash(vec2(band, slot)));
-    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 90.0 * u_sc * g;
-    vec3 c = shade(p) * (1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5));
-    float spark = zone * step(1.0 - 0.10 * g, hash(floor(gl_FragCoord.xy / 3.0) + floor(u_time * 30.0)));
-    c = min(c + spark * vec3(0.35, 0.9, 1.0) * g, vec3(1.0));
+    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 220.0 * u_sc * g;   // fette più larghe
+    // separazione dei canali: rosso spostato a destra, blu a sinistra (un solo campionamento se il glitch è debole)
+    float sep = zone * g * 5.0 * u_sc;
+    vec3 c = g > 0.01 ? vec3(shade(p + vec2(sep, 0.0)).r, shade(p).g, shade(p - vec2(sep, 0.0)).b) : shade(p);
+    c *= 1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5);
+    // linee orizzontali intere invece di puntini: righe che cambiano a scatti
+    float streak = zone * g * step(1.0 - 0.18 * g, hash(vec2(floor(gl_FragCoord.y / 2.0), floor(u_time * 18.0))));
+    c = min(c + streak * vec3(0.5, 0.9, 1.0) * 0.6, vec3(1.0));
     frag = vec4(c, max(max(c.r, c.g), c.b));   // premoltiplicato: identico sul nero, trasparente sopra il journal
 }
 """
@@ -649,6 +653,7 @@ class JournalPanel:
         self.pg, self.cfg, self.j = pygame, cfg, journal
         self.ev, self.last, self.status = [], (journal.seq if journal else 0), "starting"
         self.muted = self.filter_on = self.focus = self.err_only = self.info = False
+        self.kick, self.t_prev = 0.0, time.time()     # impulso di glitch dagli errori del log, decade in ~0.4 s
         self.query, self.rects, self.fonts = "", {}, {}
         self.host = socket.gethostname().upper()
         self.col = ([tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)) for c in cfg["colors"]]
@@ -751,10 +756,14 @@ class JournalPanel:
         surf = pg.Surface((W, H), pg.SRCALPHA)
         now = time.time()
         self.rects = {}
+        self.kick *= math.exp(-(now - self.t_prev) / 0.4)
+        self.t_prev = now
         if self.j:                                          # i messaggi arrivano anche se silenziati (come nel web)
             ev, _, self.status = self.j.wait(self.last, 0)
             for e in ev:
                 e["born"] = now
+                if e["p"] <= 3:
+                    self.kick = min(1.0, self.kick + 0.8)
                 self.last = e["id"]
                 self.ev.append(e)
             del self.ev[:-cfg["max_events"]]
@@ -1260,7 +1269,7 @@ def main():
             demo_signals(dsig, now - t0)
         s = dsig if demo else sig
         scene.update(dt, s.audio, net_norm(s.down_mbps, a.max_mbps),
-                     net_norm(s.up_mbps, a.max_mbps), s.cpu, s.ram, W, H, s.swap)
+                     net_norm(s.up_mbps, a.max_mbps), s.cpu, s.ram, W, H, max(s.swap, panel.kick))
         ov, top = panel.draw(W, H, s)
         rend.draw(scene, W, H, ov, top)
         pygame.display.flip()
