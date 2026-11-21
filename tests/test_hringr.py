@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Prova senza schermo né audio:  .venv/bin/python -m unittest discover -s tests"""
 import argparse
+import configparser
+import io
 import json
 import sys
 import tempfile
@@ -16,6 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import hringr  # noqa: E402
 import hringr_web  # noqa: E402
+import journal_stream  # noqa: E402
 
 
 class Config(unittest.TestCase):
@@ -84,8 +87,19 @@ class Proc(unittest.TestCase):
         ram = hringr.read_ram(self.sample("MemTotal: 1000 kB\nMemAvailable: 250 kB\n"))
         self.assertAlmostEqual(ram, 0.75)
 
+    def test_swap_rate_and_match(self):
+        self.assertEqual(hringr.read_swap(self.sample("pswpin 3\npswpout 4\nother 9\n")), 7)
+        self.assertEqual(hringr.swap_norm(0), 0.0)
+        self.assertEqual(hringr.swap_norm(10**6), 1.0)
+        e = {"u": "nginx.service", "p": 3, "m": "boom"}
+        self.assertTrue(hringr.match_query(e, "level:err unit:ngin -zzz"))
+        self.assertFalse(hringr.match_query(e, "level:emerg"))
+        self.assertFalse(hringr.match_query(e, "-boom"))
+
     def test_real_system(self):
         self.assertTrue(0.0 <= hringr.read_ram() <= 1.0)
+        self.assertGreaterEqual(hringr.read_swap(), 0)
+        self.assertGreater(hringr.read_uptime(), 0)
 
 
 class Shared(unittest.TestCase):
@@ -97,6 +111,33 @@ class Shared(unittest.TestCase):
     def test_shader_table_size_matches_params(self):
         self.assertIn(f"const int N = {hringr.TAB_N};", hringr.RING_FS)
         self.assertIn(f"const int N = {hringr.TAB_N};", (ROOT / "hringr.html").read_text())
+
+
+class JournalParse(unittest.TestCase):
+    def test_full_and_missing_fields(self):
+        e = journal_stream.parse(b'{"MESSAGE":"ciao  mondo","PRIORITY":"3","_SYSTEMD_UNIT":"a.service","__REALTIME_TIMESTAMP":"2000000"}', 50)
+        self.assertEqual((e["u"], e["p"], e["m"], e["t"]), ("a.service", 3, "ciao mondo", 2.0))
+        e = journal_stream.parse(b'{"MESSAGE":null,"SYSLOG_IDENTIFIER":"x"}', 50)   # campo troppo lungo / priorità assente
+        self.assertEqual((e["u"], e["p"]), ("x", 6))
+        self.assertEqual(journal_stream.parse(b'{}', 50)["u"], "(unknown)")
+
+    def test_garbage_binary_and_clamp(self):
+        self.assertIsNone(journal_stream.parse(b"non json", 50))
+        self.assertIsNone(journal_stream.parse(b"[1]", 50))
+        self.assertEqual(journal_stream.parse(b'{"MESSAGE":[104,105],"PRIORITY":"99"}', 50)["m"], "hi")
+        self.assertEqual(len(journal_stream.parse(b'{"MESSAGE":"' + b"x" * 500 + b'"}', 50)["m"]), 50)
+
+    def test_oversized_line_is_skipped(self):
+        j = journal_stream.Journal()
+        big = b'{"MESSAGE":"' + b"x" * (journal_stream.MAX_LINE + 10) + b'"}\n{"MESSAGE":"ok"}\n'
+        j._read(io.BytesIO(big))
+        self.assertEqual([e["m"] for e in j.buf], ["ok"])
+
+    def test_buffer_is_bounded_and_counts_exact(self):
+        j = journal_stream.Journal(buffer=5)
+        for _ in range(20):
+            j._add({"p": 4})
+        self.assertEqual((len(j.buf), j.counts[4]), (5, 20))
 
 
 class Web(unittest.TestCase):
@@ -119,6 +160,32 @@ class Web(unittest.TestCase):
         self.assertEqual(d["params"], hringr.PARAMS)
         self.assertEqual(d["max_mbps"], "200.0")
 
+    def test_journal_forbidden_for_non_local_host(self):
+        saved = hringr_web.journal, hringr_web.args.__dict__.get("jcfg")
+        hringr_web.journal, hringr_web.args.jcfg = journal_stream.Journal(), {"network": "no"}
+        try:
+            req = urllib.request.Request(self.base + "/journal", headers={"Host": "192.168.1.5"})
+            with self.assertRaises(urllib.error.HTTPError) as c:
+                urllib.request.urlopen(req)
+            self.assertEqual(c.exception.code, 403)
+        finally:
+            hringr_web.journal, hringr_web.args.jcfg = saved
+
+    def test_journal_config_validation(self):
+        cp = configparser.ConfigParser()
+        cp.read_string("[journal]\ncolors = FF0000\n")
+        with self.assertRaises(SystemExit):
+            hringr_web.journal_cfg(cp)
+        self.assertEqual(len(hringr_web.journal_cfg(configparser.ConfigParser())["colors"]), 8)
+
+    def test_fonts_served_but_no_path_traversal(self):
+        r = urllib.request.urlopen(self.base + "/fonts/ChakraPetch-Regular.ttf")
+        self.assertEqual((r.status, r.headers["Content-Type"]), (200, "font/ttf"))
+        for bad in ("/fonts/../hringr.py", "/fonts/..%2fhringr.py", "/fonts/OFL.txt", "/fonts/nope.ttf"):
+            with self.assertRaises(urllib.error.HTTPError) as c:
+                urllib.request.urlopen(self.base + bad)
+            self.assertEqual(c.exception.code, 404, bad)
+
     def test_unknown_path_is_404(self):
         with self.assertRaises(urllib.error.HTTPError) as c:
             urllib.request.urlopen(self.base + "/nope")
@@ -138,3 +205,10 @@ class Web(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Tailnet(unittest.TestCase):
+    def test_tailnet_ranges(self):
+        self.assertTrue(hringr_web.in_tailnet("100.101.2.3"))
+        self.assertTrue(hringr_web.in_tailnet("fd7a:115c:a1e0::1"))
+        self.assertFalse(hringr_web.in_tailnet("192.168.1.5"))

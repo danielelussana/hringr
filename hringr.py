@@ -18,7 +18,7 @@ Uso:
   python hringr.py --demo       # segnali simulati
   python hringr.py --fullscreen # dati reali
 Configurazione: config.ini (stessa cartella) fornisce i valori predefiniti, es. shape = bubbles.
-Tasti: F schermo intero, D demo on/off, ESC o Q esce.
+Keys: F full screen, D demo on/off, ESC or Q quit.
 """
 import argparse
 import configparser
@@ -38,7 +38,7 @@ def _hex(h):
 def _positive(s):
     v = float(s)
     if not v > 0:
-        raise argparse.ArgumentTypeError(f"deve essere maggiore di 0 (trovato '{s}')")
+        raise argparse.ArgumentTypeError(f"must be greater than 0 (got '{s}')")
     return v
 
 
@@ -46,7 +46,7 @@ def _color(s):
     s = s.strip().lstrip("#")
     if len(s) != 6:
         raise argparse.ArgumentTypeError(
-            f"colore non valido '{s}': servono 6 cifre esadecimali (RRGGBB); nel config.ini scrivere senza '#'")
+            f"invalid color '{s}': 6 hex digits (RRGGBB) needed; in config.ini write it without '#'")
     return _hex(s)
 
 # Costanti condivise con la versione web (che le riceve da hringr_web.py in /config.json).
@@ -80,7 +80,9 @@ class Signals:
         self.up_mbps = 0.0
         self.cpu = 0.0            # 0..1
         self.ram = 0.0            # 0..1
-        self.audio_status = "audio: in avvio"
+        self.swap = 0.0           # 0..1: attività di swap (glitch)
+        self.swap_pps = 0.0       # pagine/s scambiate con lo swap (in + out), per la barra del journal
+        self.audio_status = "audio: starting"
 
 
 def start_audio_thread(sig, device=None, gain_db=0.0):
@@ -92,7 +94,7 @@ def start_audio_thread(sig, device=None, gain_db=0.0):
                 mics = sc.all_microphones(include_loopback=True)
                 mic = next((m for m in mics if device.lower() in m.name.lower()), None)
                 if mic is None:
-                    raise RuntimeError(f"dispositivo '{device}' non trovato: "
+                    raise RuntimeError(f"device '{device}' not found: "
                                        + ", ".join(m.name for m in mics))
             else:
                 mic = sc.get_microphone(sc.default_speaker().name, include_loopback=True)
@@ -104,7 +106,7 @@ def start_audio_thread(sig, device=None, gain_db=0.0):
                     db = 20 * math.log10(rms) + gain_db
                     sig.audio = min(1.0, max(0.0, (db + 55.0) / 45.0))  # -55 dB..-10 dB
         except Exception as e:  # noqa: BLE001
-            sig.audio_status = f"audio NON disponibile ({e})"
+            sig.audio_status = f"audio NOT available ({e})"
             sig.audio = 0.0
     threading.Thread(target=run, daemon=True).start()
 
@@ -126,13 +128,13 @@ def start_bridge_thread(sig, url, scale):
                 bars = d.get("bars") or []
                 if d.get("error") or not bars or (d.get("age_ms") or 0) > 1500:
                     sig.audio = 0.0
-                    sig.audio_status = "audio: bridge attivo, nessun segnale"
+                    sig.audio_status = "audio: bridge active, no signal"
                 else:
                     sig.audio = min(1.0, (sum(bars) / len(bars)) / scale)
                     sig.audio_status = "audio: mpd-spectrum (cava)"
             except Exception as e:  # noqa: BLE001
                 sig.audio = 0.0
-                sig.audio_status = f"audio: bridge non raggiungibile ({e})"
+                sig.audio_status = f"audio: bridge unreachable ({e})"
             time.sleep(0.04)
     threading.Thread(target=run, daemon=True).start()
 
@@ -158,6 +160,11 @@ def read_net(path="/proc/net/dev"):
     return rx, tx
 
 
+def read_uptime(path="/proc/uptime"):
+    """Secondi dall'avvio del sistema, da /proc/uptime (Linux)."""
+    return float(Path(path).read_text().split()[0])
+
+
 def read_cpu(path="/proc/stat"):
     """(tempo totale, tempo inattivo) in tick, dalla riga 'cpu' aggregata."""
     f = [int(x) for x in Path(path).read_text().splitlines()[0].split()[1:]]
@@ -173,18 +180,34 @@ def read_ram(path="/proc/meminfo"):
     return 1.0 - m["MemAvailable"] / m["MemTotal"]
 
 
+def read_swap(path="/proc/vmstat"):
+    """Pagine scambiate con lo swap (in + out) dall'avvio, da /proc/vmstat."""
+    v = dict(line.split() for line in Path(path).read_text().splitlines())
+    return int(v["pswpin"]) + int(v["pswpout"])
+
+
+def swap_norm(pps):
+    """Attività di swap 0..1 (log): 2000 pagine/s (~8 MB/s) = massimo."""
+    return min(1.0, math.log1p(max(pps, 0.0)) / math.log1p(2000.0))
+
+
 def start_stats_thread(sig):
-    """Rete (download/upload), CPU e RAM, campionati 5 volte al secondo (da /proc: Linux)."""
+    """Rete (download/upload), CPU, RAM e swap, campionati 5 volte al secondo (da /proc: Linux)."""
     def run():
         rx0, tx0 = read_net()
         c0 = read_cpu()
+        sw0 = read_swap()
         t0 = time.time()
         while True:
             time.sleep(0.2)
             rx1, tx1 = read_net()
             c1 = read_cpu()
+            sw1 = read_swap()
             t1 = time.time()
             dt = t1 - t0
+            pps = max(0, sw1 - sw0) / dt
+            sig.swap_pps += (pps - sig.swap_pps) * 0.5
+            sig.swap = swap_norm(sig.swap_pps)
             d = max(0, rx1 - rx0) * 8 / 1e6 / dt
             u = max(0, tx1 - tx0) * 8 / 1e6 / dt
             sig.down_mbps += (d - sig.down_mbps) * 0.5
@@ -192,7 +215,7 @@ def start_stats_thread(sig):
             dtot = c1[0] - c0[0]
             sig.cpu = min(1.0, max(0.0, 1.0 - (c1[1] - c0[1]) / dtot)) if dtot > 0 else sig.cpu
             sig.ram = read_ram()
-            rx0, tx0, c0, t0 = rx1, tx1, c1, t1
+            rx0, tx0, c0, t0, sw0 = rx1, tx1, c1, t1, sw1
     threading.Thread(target=run, daemon=True).start()
 
 
@@ -203,6 +226,8 @@ def demo_signals(sig, t):
     sig.up_mbps = 80 * max(0.0, math.sin(t * 0.53 + 3.0)) ** 3
     sig.cpu = 0.5 + 0.5 * math.sin(t * 0.3)
     sig.ram = 0.55 + 0.2 * math.sin(t * 0.1)
+    sig.swap = max(0.0, math.sin(t * 0.23 + 2.0)) ** 4 * 0.9
+    sig.swap_pps = sig.swap * 600
 
 
 def net_norm(mbps, max_mbps):
@@ -223,6 +248,7 @@ class Scene:
         self.level = 0.0
         self.pin = 0.0                    # CPU smussata: velocità dell'effetto interno
         self.bri = 0.0                    # RAM smussata (40%..85% -> 0..1): luminosità dell'effetto interno
+        self.glitch = 0.0                 # attività di swap smussata: intensità del glitch sull'anello
         self.pulses = []                  # [età normalizzata 0..1, forza, durata s]
         self.pulse_timer = 0.0
         self.flash = 0.0                  # lampo del perimetro quando arriva un impulso
@@ -268,10 +294,11 @@ class Scene:
         self.kind = np.concatenate([self.kind, np.full(n, kind, np.int8)])
         self.ph = np.concatenate([self.ph, self.rng.uniform(0, 2 * np.pi, n).astype(np.float32)])
 
-    def update(self, dt, audio, down, up, cpu, ram, w, h):
-        """audio, down, up, cpu, ram in 0..1."""
+    def update(self, dt, audio, down, up, cpu, ram, w, h, swap=0.0):
+        """audio, down, up, cpu, ram, swap in 0..1."""
         rng = self.rng
         self.time += dt
+        self.glitch += (swap - self.glitch) * (1 - math.exp(-dt / (0.05 if swap > self.glitch else 0.5)))
         k = 1 - math.exp(-dt / (0.03 if audio > self.level else 0.25))
         self.level += (audio - self.level) * k
         self.phase += WS * (1.0 + 5.0 * self.level) * dt
@@ -326,7 +353,10 @@ class Scene:
                       (rng.uniform(3, 11, n_out) * sc).astype(np.float32), col, 1)
 
         # --- movimento e rimozione
-        self.pos += self.dir * (self.spd * dt)[:, None]
+        # velocità: in arrivo accelerano avvicinandosi all'anello; in uscita partono piano e accelerano
+        u = (np.hypot(self.pos[:, 0], self.pos[:, 1]) - self.radius(np.arctan2(self.pos[:, 1], self.pos[:, 0]))) / self.r0
+        m = np.where(self.kind == 0, 1 + 2.2 * np.exp(-u / 0.25), 0.3 + 1.7 * (1 - np.exp(-np.maximum(u, 0) / 0.2)))
+        self.pos += self.dir * (self.spd * m * dt)[:, None]
         r = np.hypot(self.pos[:, 0], self.pos[:, 1])
         th = np.arctan2(self.pos[:, 1], self.pos[:, 0])
         ring = self.radius(th)
@@ -421,6 +451,7 @@ uniform sampler2D u_tab;
 uniform vec3  u_core, u_glow, u_halo, u_echo, u_pcol, u_liq;
 uniform vec2  u_pulse[6];
 uniform float u_liquid, u_flow, u_energy, u_r0;
+uniform float u_glitch, u_time;
 out vec4 frag;
 const int N = 512;
 const float PI = 3.14159265;
@@ -433,8 +464,7 @@ float tab(float u, int row){
     return mix(texelFetch(u_tab, ivec2(i0, row), 0).r,
                texelFetch(u_tab, ivec2(i1, row), 0).r, f);
 }
-void main(){
-    vec2 p = gl_FragCoord.xy - 0.5 * u_res;
+vec3 shade(vec2 p){
     float r = length(p);
     float u = (atan(p.y, p.x) + PI) / (2.0 * PI) * float(N);
     float R = tab(u, 0);
@@ -485,9 +515,23 @@ void main(){
     float fg = 1.0 + 0.35 * u_flash;   // l'alone reagisce al lampo meno del bordo (evita il ciano saturo)
     vec3 col = core * f * mix(u_core, vec3(0.93, 0.93, 0.94), min(1.0, u_level + 0.5 * u_flash))
              + near * fg * u_glow + far * fg * u_halo + echo * u_echo + pul * u_pcol + liq;
-    frag = vec4(min(col, vec3(1.0)), 1.0);
+    return col;
+}
+float hash(vec2 q){ return fract(sin(dot(q, vec2(127.1, 311.7))) * 43758.5453); }
+void main(){
+    // glitch da swap: righe spezzate e sfarfallio nella zona dell'anello (dentro 1.7 r0), più fitti con u_glitch
+    vec2 p = gl_FragCoord.xy - 0.5 * u_res;
+    float g = u_glitch, zone = 1.0 - smoothstep(1.2 * u_r0, 1.7 * u_r0, length(p));
+    float slot = floor(u_time * 12.0), band = floor(gl_FragCoord.y / 14.0);
+    float cut = step(1.0 - 0.7 * g, hash(vec2(band, slot)));
+    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 90.0 * u_sc * g;
+    vec3 c = shade(p) * (1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5));
+    float spark = zone * step(1.0 - 0.10 * g, hash(floor(gl_FragCoord.xy / 3.0) + floor(u_time * 30.0)));
+    c = min(c + spark * vec3(0.35, 0.9, 1.0) * g, vec3(1.0));
+    frag = vec4(c, max(max(c.r, c.g), c.b));   // premoltiplicato: identico sul nero, trasparente sopra il journal
 }
 """
+
 TRI_VS = """
 #version 140
 uniform vec2 u_res;
@@ -556,6 +600,267 @@ void main(){
 """
 
 
+# ----------------------------------------------------------------------------- journal (desktop)
+# Stesso journal della versione web (journal_stream.Journal, in sola lettura): bolle e barra dei dati disegnate
+# su una superficie 2D, caricata come texture sotto l'anello. Stessi tasti e stessa sintassi del filtro.
+OVERLAY_VS = """
+#version 140
+in vec2 in_pos;
+out vec2 v_uv;
+void main(){ gl_Position = vec4(in_pos, 0.0, 1.0); v_uv = in_pos * 0.5 + 0.5; }
+"""
+OVERLAY_FS = """
+#version 140
+uniform sampler2D u_img;
+in vec2 v_uv;
+out vec4 frag;
+void main(){ vec4 c = texture(u_img, v_uv); frag = vec4(c.rgb * c.a, c.a); }
+"""
+PR_MAP = {"emerg": 0, "emergency": 0, "alert": 1, "crit": 2, "critical": 2, "err": 3, "error": 3,
+          "warn": 4, "warning": 4, "notice": 5, "info": 6, "debug": 7}
+PRIO_LABEL = ["EMERG", "ALERT", "CRIT", "ERR", "WARN", "NOTICE", "INFO", "DEBUG"]
+FONT_DIR = Path(__file__).resolve().parent / "fonts"
+
+
+def match_query(e, q):
+    """query: parole (in unità e messaggio), unit:nome, level:err (= err o più grave), -termine per escludere."""
+    for t in q.strip().lower().split():
+        neg = t.startswith("-") and len(t) > 1
+        body = t[1:] if neg else t
+        i = body.find(":")
+        k, v = (body[:i], body[i + 1:]) if i > 0 else ("", "")
+        if k in ("unit", "u"):
+            ok = v in e["u"].lower()
+        elif k in ("level", "prio", "p"):
+            ok = v in PR_MAP and e["p"] <= PR_MAP[v]
+        else:
+            ok = body in (e["u"] + " " + e["m"]).lower()
+        if ok == neg:
+            return False
+    return True
+
+
+class JournalPanel:
+    """Journal, barra dei dati e pulsanti. journal=None: solo il pulsante info (journal disabilitato)."""
+
+    def __init__(self, cfg, journal):
+        import pygame
+        import socket
+        self.pg, self.cfg, self.j = pygame, cfg, journal
+        self.ev, self.last, self.status = [], (journal.seq if journal else 0), "starting"
+        self.muted = self.filter_on = self.focus = self.err_only = self.info = False
+        self.query, self.rects, self.fonts = "", {}, {}
+        self.host = socket.gethostname().upper()
+        self.col = ([tuple(int(c[i:i + 2], 16) for i in (0, 2, 4)) for c in cfg["colors"]]
+                    if journal else [])
+
+    def font(self, mono, size):
+        key = (mono, size)
+        if key not in self.fonts:
+            f = FONT_DIR / ("ShareTechMono-Regular.ttf" if mono else "ChakraPetch-SemiBold.ttf")
+            self.fonts[key] = self.pg.font.Font(str(f) if f.exists() else None, size)
+        return self.fonts[key]
+
+    def event(self, e):
+        """True se l'evento è del journal (non va ai tasti dell'anello)."""
+        pg = self.pg
+        if e.type == pg.MOUSEBUTTONDOWN and e.button == 1:
+            for k, r in self.rects.items():
+                if r.collidepoint(e.pos):
+                    if k == "mute":
+                        self.muted = not self.muted
+                    elif k == "err":
+                        self.err_only = not self.err_only
+                    elif k == "info":
+                        self.info = not self.info
+                    elif k == "filter":
+                        self.filter_on = not self.filter_on
+                    else:
+                        self.set_focus(True)
+                    return True
+            self.set_focus(False)
+            return False
+        if self.focus:
+            if e.type == pg.TEXTINPUT:
+                self.query += e.text
+            elif e.type == pg.KEYDOWN:
+                if e.key == pg.K_BACKSPACE:
+                    self.query = self.query[:-1]
+                elif e.key in (pg.K_ESCAPE, pg.K_RETURN, pg.K_KP_ENTER):
+                    self.set_focus(False)
+            return True
+        return False
+
+    def set_focus(self, on):
+        if on != self.focus:
+            self.focus = on
+            (self.pg.key.start_text_input if on else self.pg.key.stop_text_input)()
+
+    def _button(self, surf, x, y, glyph, active, color):
+        pg = self.pg
+        r = pg.Rect(x, y, 26, 26)
+        self.rects[glyph[0]] = r
+        pg.draw.rect(surf, (6, 8, 12, 217), r)
+        pg.draw.rect(surf, color if active else (74, 90, 106), r, 1)
+        if glyph[1] == "x":                                     # silenzia: croce
+            m = 8
+            for a, b in (((r.x + m, r.y + m), (r.right - m, r.bottom - m)),
+                         ((r.right - m, r.y + m), (r.x + m, r.bottom - m))):
+                pg.draw.line(surf, color if active else (180, 194, 209), a, b, 2)
+        else:
+            img = self.font(False, 15).render(glyph[1], True, color if active else (180, 194, 209))
+            surf.blit(img, img.get_rect(center=r.center))
+
+    def _info_layer(self, W, H, s):
+        """Riquadro info sopra l'anello, nella parte bassa: hostname, uptime, modalità."""
+        pg = self.pg
+        surf = pg.Surface((W, H), pg.SRCALPHA)
+        scale = self.cfg["font_scale"] if self.j else 1.0
+        fs = max(12, round(min(H * 0.016, W / 30) * scale))
+        r0 = 0.30 * min(W, H)
+        mode = "journal disabled" if not self.j else ("journal off" if self.muted else "journal on")
+        up = read_uptime()
+        d, rem = divmod(int(up), 86400)
+        hh, rem = divmod(rem, 3600)
+        mm, ss = divmod(rem, 60)
+        upt = (f"{d}d " if d else "") + f"{hh:02d}:{mm:02d}:{ss:02d}"
+        f_host, f_small = self.font(False, round(fs * 3.2)), self.font(True, round(fs * 1.4))
+        lines = [(f_host, self.host, (232, 241, 251)), (f_small, ("uptime " + upt).upper(), (180, 194, 209)),
+                 (f_small, mode.upper(), (141, 160, 179))]
+        pad = round(fs * 0.6)
+        w = min(round(r0 * 1.5), W - 24)
+        h = pad * 2 + sum(f.get_linesize() for f, _, _ in lines)
+        x, y = (W - w) // 2, round(H / 2 + r0 * 0.3)
+        c = round(fs / 0.82 * 1.1)                                # stessi angoli tagliati del dettaglio journal
+        pts = [(x + c, y), (x + w, y), (x + w, y + h - c), (x + w - c, y + h), (x, y + h), (x, y + c)]
+        pg.draw.polygon(surf, (141, 160, 179, 60), pts, 3)        # alone, come il dettaglio del journal
+        pg.draw.polygon(surf, (6, 8, 12, 128), pts)               # riquadro semitrasparente, testo pieno
+        pg.draw.polygon(surf, (141, 160, 179, 230), pts, 1)
+        yy = y + pad
+        for f, text, colr in lines:
+            while len(text) > 1 and f.size(text)[0] > w - 2 * pad:
+                text = text[:-2] + "…"
+            img = f.render(text, True, colr)
+            surf.blit(img, img.get_rect(midtop=(x + w // 2, yy)))
+            yy += f.get_linesize()
+        return pg.image.tostring(surf, "RGBA", True)
+
+    def draw(self, W, H, s):
+        """(strato sotto l'anello, strato sopra l'anello): RGBA dal basso in alto, oppure None."""
+        pg, cfg = self.pg, self.cfg
+        surf = pg.Surface((W, H), pg.SRCALPHA)
+        now = time.time()
+        self.rects = {}
+        if self.j:                                          # i messaggi arrivano anche se silenziati (come nel web)
+            ev, _, self.status = self.j.wait(self.last, 0)
+            for e in ev:
+                e["born"] = now
+                self.last = e["id"]
+                self.ev.append(e)
+            del self.ev[:-cfg["max_events"]]
+            self.ev = [e for e in self.ev if now - e["born"] < cfg["window_s"]]
+        # pulsanti in alto a destra: silenzia, errori, info (info è sempre presente)
+        n = 2 if self.j else 0
+        if self.j:
+            self._button(surf, W - 38, 12, ("mute", "x"), self.muted, (255, 42, 61))
+            self._button(surf, W - 72, 12, ("err", "!"), self.err_only, (255, 214, 10))
+        self._button(surf, W - 38 - 34 * n, 12, ("info", "i"), self.info, (141, 160, 179))
+        top = self._info_layer(W, H, s) if self.info else None
+        if not self.j or self.muted:
+            return pg.image.tostring(surf, "RGBA", True), top
+
+        # barra in basso: dati su cui si basa hringr, poi filtro (come jbar nella versione web)
+        sc = min(W, H) / 800
+        bar_h = max(30, round(40 * sc))
+        y0 = H - bar_h
+        pg.draw.rect(surf, (6, 8, 12, 235), (0, y0, W, bar_h))
+        pg.draw.line(surf, (28, 42, 56), (0, y0), (W, y0))
+        fb = self.font(True, max(11, round(bar_h * 0.36)))
+        text = (f"CPU {round(s.cpu * 100):3d}%  RAM {round(s.ram * 100):3d}%  DOWN {s.down_mbps:6.1f}  "
+                f"UP {s.up_mbps:6.1f} Mbit/s  SWAP {s.swap_pps:4.0f} p/s")
+        qw = min(round(420 * sc), W * 2 // 5)
+        qx = W - 12 - qw
+        fw = fb.size("filter")[0]
+        fx = qx - 12 - 20 - fw                       # casella del filtro, poi la scritta "filter"
+        ty = y0 + (bar_h - fb.get_height()) // 2
+        stat = text
+        while stat and fb.size(stat)[0] > fx - 24:
+            stat = stat[:-1]
+        surf.blit(fb.render(stat, True, (141, 160, 179)), (12, ty))
+        box = pg.Rect(fx, y0 + bar_h // 2 - 7, 14, 14)
+        self.rects["filter"] = pg.Rect(fx - 4, y0, fw + 48, bar_h)
+        pg.draw.rect(surf, (180, 194, 209), box, 1)
+        if self.filter_on:
+            pg.draw.rect(surf, (180, 194, 209), box.inflate(-6, -6))
+        surf.blit(fb.render("filter", True, (180, 194, 209)), (fx + 20, ty))
+        qbox = pg.Rect(qx, y0 + 6, qw, bar_h - 12)
+        self.rects["query"] = qbox
+        pg.draw.rect(surf, (11, 17, 24), qbox)
+        pg.draw.rect(surf, (28, 42, 56), qbox, 1)
+        q = self.query
+        while q and fb.size(q)[0] > qw - 14:
+            q = q[1:]
+        caret = "_" if self.focus and int(now * 2) % 2 == 0 else ""
+        surf.blit(fb.render(q + caret, True, (220, 230, 242)), (qx + 7, ty))
+        if not self.query and not self.focus:
+            surf.blit(fb.render("search: level:err unit:nginx -word", True, (74, 90, 106)), (qx + 7, ty))
+
+        # bolle in alto: 1 colonna su telefono, fino a 3 su monitor larghi
+        f_size = max(12, round(min(H * 0.016, W / 30) * cfg["font_scale"]))
+        f = f_size / 0.82
+        pad, gap, c = f, f * 0.6, f * 1.1
+        cols = max(1, min(3, int((W - 2 * pad + gap) // (f * 24))))
+        bw = (W - 2 * pad - (cols - 1) * gap) / cols
+        bh = f * 3.4
+        limit = round(H * cfg["height"])
+        ev = self.ev
+        if self.err_only:
+            ev = [e for e in ev if e["p"] <= 4]     # solo emerg..warning, niente log "azzurri"
+        ev = [e for e in ev if not self.filter_on or not self.query.strip() or match_query(e, self.query)]
+        by, col = pad, 0
+        for e in reversed(ev):
+            if by + bh > limit:
+                break
+            age = now - e["born"]
+            life = 1 - age / (cfg["window_s"] * 0.7)
+            if life < 0.12:
+                continue
+            bx = pad + col * (bw + gap)
+            alpha = cfg["opacity"] * min(1, age * 4) * min(1, life * 2)
+            cc = self.col[e["p"]]
+            pts = [(bx + c, by), (bx + bw, by), (bx + bw, by + bh - c), (bx + bw - c, by + bh), (bx, by + bh), (bx, by + c)]
+            pg.draw.polygon(surf, (6, 8, 12, int(235 * alpha)), pts)
+            pg.draw.polygon(surf, cc + (int(255 * alpha * (0.5 if e["p"] <= 4 else 0.35)),), pts, 1)
+            fu = self.font(False, max(10, round(f * 0.72)))
+            tm = time.strftime("%H:%M:%S", time.localtime(e["t"]))
+            rx = bx + bw - pad - c * 0.3
+            head = [(tm, (141, 160, 179)), ("  ", None), (PRIO_LABEL[e["p"]], cc)]
+            hx = rx - sum(fu.size(t)[0] for t, _ in head)
+            for t, tc in head:
+                if tc:
+                    img = fu.render(t, True, tc)
+                    img.set_alpha(int(255 * alpha))
+                    surf.blit(img, (hx, by + f * 0.95 - img.get_height() / 2))
+                hx += fu.size(t)[0]
+            unit = e["u"].replace(".service", "")
+            while len(unit) > 1 and fu.size(unit)[0] > rx - hx - pad - f:
+                unit = unit[:-2] + "…"
+            img = fu.render(unit, True, (180, 194, 209))
+            img.set_alpha(int(255 * alpha))
+            surf.blit(img, (bx + pad, by + f * 0.95 - img.get_height() / 2))
+            fm = self.font(True, max(11, round(f * 0.82)))
+            body = e["m"]
+            while len(body) > 1 and fm.size(body)[0] > bw - 2 * pad:
+                body = body[:-2] + "…"
+            img = fm.render(body, True, (232, 241, 251))
+            img.set_alpha(int(255 * alpha))
+            surf.blit(img, (bx + pad, by + f * 2.15 - img.get_height() / 2))
+            col += 1
+            if col == cols:
+                col, by = 0, by + bh + gap
+        return pg.image.tostring(surf, "RGBA", True), top
+
+
 class Renderer:
     def __init__(self, ctx):
         import moderngl
@@ -573,12 +878,28 @@ class Renderer:
         self.tex = ctx.texture((TAB_N, 2), 1, dtype="f4")
         self.tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
         self.ring["u_tab"].value = 0
+        self.ov = ctx.program(vertex_shader=OVERLAY_VS, fragment_shader=OVERLAY_FS)
+        self.ov_vao = ctx.vertex_array(self.ov, [(ctx.buffer(quad), "2f", "in_pos")])
+        self.ov_tex = self.top_tex = None
 
-    def draw(self, scene, w, h):
+    def _layer(self, tex, data, unit, w, h):
+        """Strato RGBA premoltiplicato a schermo intero (journal, riquadro info)."""
+        ctx, mgl = self.ctx, self.mgl
+        if tex is None or tex.size != (w, h):
+            tex = ctx.texture((w, h), 4)
+        tex.write(data)
+        ctx.enable(mgl.BLEND); ctx.blend_func = mgl.ONE, mgl.ONE_MINUS_SRC_ALPHA
+        tex.use(unit); self.ov["u_img"].value = unit
+        self.ov_vao.render(mgl.TRIANGLE_STRIP)
+        return tex
+
+    def draw(self, scene, w, h, overlay=None, top=None):
         ctx, mgl = self.ctx, self.mgl
         ctx.viewport = (0, 0, w, h)
         ctx.clear(0.0, 0.0, 0.0, 1.0)
-        ctx.disable(mgl.BLEND)
+        if overlay is not None:                       # journal: sotto l'anello
+            self.ov_tex = self._layer(self.ov_tex, overlay, 1, w, h)
+        ctx.enable(mgl.BLEND); ctx.blend_func = mgl.ONE, mgl.ONE_MINUS_SRC_ALPHA   # anello premoltiplicato
 
         r = self.ring
         r["u_res"].value = (w, h)
@@ -593,10 +914,13 @@ class Renderer:
         r["u_pulse"].write(scene.pulse_uniform().tobytes())
         r["u_liquid"].value = float(scene.inner == "liquid")
         r["u_flow"].value, r["u_energy"].value, r["u_r0"].value = scene.flow, scene.bri, scene.r0
+        r["u_glitch"].value, r["u_time"].value = scene.glitch, scene.time
         r["u_liq"].value = scene.liq
         self.tex.write(scene.tab.tobytes())
         self.tex.use(0)
         self.quad_vao.render(mgl.TRIANGLE_STRIP)
+        if top is not None:                           # riquadro info: sopra l'anello
+            self.top_tex = self._layer(self.top_tex, top, 2, w, h)
 
         v = scene.vertices()
         if len(v):
@@ -787,7 +1111,7 @@ def load_config(ap):
         dest = key.replace("-", "_")
         act = next((x for x in ap._actions if x.dest == dest and dest not in ("help", "config")), None)
         if act is None:
-            ap.error(f"{path}: opzione sconosciuta '{key}'")
+            ap.error(f"{path}: unknown option '{key}'")
         if isinstance(act, argparse._StoreTrueAction):
             val = cp.getboolean("hringr", key)
         else:
@@ -796,16 +1120,16 @@ def load_config(ap):
             except (ValueError, argparse.ArgumentTypeError) as e:
                 ap.error(f"{path}: {key}: {e}")
         if act.choices and val not in act.choices:
-            ap.error(f"{path}: {key} deve essere uno tra {', '.join(map(str, act.choices))} (trovato '{raw}')")
+            ap.error(f"{path}: {key} must be one of {', '.join(map(str, act.choices))} (got '{raw}')")
         defaults[dest] = val
     ap.set_defaults(**defaults)
 
 
-EPILOG = '''Ogni opzione si può impostare anche in config.ini, sezione [hringr], senza "--" (trattini o "_"):
+EPILOG = '''Every option can also be set in config.ini, section [hringr], without "--" (dashes or "_"):
   shape, inner, liquid_color, demo, fullscreen, audio_source, bridge_url, bridge_scale, audio_device,
   audio_gain, max_mbps, tri_size, display, size
-Le opzioni a riga di comando prevalgono sul file. I valori booleani si scrivono true/false.
-Tasti: F schermo intero, D demo on/off, ESC o Q esce.'''
+Command-line options take precedence over the file. Boolean values are written true/false.
+Keys: F full screen, D demo on/off, ESC or Q quit.'''
 
 
 def main():
@@ -813,34 +1137,43 @@ def main():
         pass
 
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=Fmt, add_help=False, epilog=EPILOG)
-    ap.add_argument("-h", "--help", action="help", help="mostra questo aiuto ed esce")
+    ap.add_argument("-h", "--help", action="help", help="show this help and exit")
     ap.add_argument("--config", default=str(Path(__file__).with_name("config.ini")),
-                    help="file di configurazione (valori predefiniti; la riga di comando prevale)")
+                    help="configuration file (default values; the command line takes precedence)")
     ap.add_argument("--shape", choices=("triangles", "bubbles"), default=DEFAULTS["shape"],
-                    help="forma di ciò che si dirige verso il cerchio: triangoli o bolle")
+                    help="shape of what flows toward the circle: triangles or bubbles")
     ap.add_argument("--inner", choices=("pulse", "liquid"), default=DEFAULTS["inner"],
-                    help="effetto dentro il cerchio: pulse = battito ad anelli, liquid = liquido che si muove")
+                    help="effect inside the circle: pulse = rings beating from the centre, liquid = moving liquid")
     ap.add_argument("--liquid-color", type=_color, default=DEFAULTS["liquid_color"],
-                    help="colore del liquido, esadecimale RRGGBB (nel config.ini scrivere senza '#')")
-    ap.add_argument("--demo", action="store_true", help="segnali simulati")
-    ap.add_argument("--fullscreen", action="store_true", help="schermo intero (si può alternare con il tasto F)")
+                    help="liquid color, hex RRGGBB (in config.ini write it without '#')")
+    ap.add_argument("--demo", action="store_true", help="simulated signals")
+    ap.add_argument("--fullscreen", action="store_true", help="full screen (toggle with the F key)")
     ap.add_argument("--audio-source", choices=("auto", "bridge", "loopback"), default=DEFAULTS["audio_source"],
-                    help="bridge = barre di cava da mpd-spectrum (nessun conflitto con MPD); "
-                         "loopback = cattura diretta dalla scheda; auto = bridge se raggiungibile")
+                    help="bridge = cava bars from mpd-spectrum (no conflict with MPD); "
+                         "loopback = direct capture from the sound card; auto = bridge if reachable")
     ap.add_argument("--bridge-url", default=DEFAULTS["bridge_url"],
-                    help="indirizzo da cui leggere le barre di cava (mpd-spectrum)")
+                    help="address to read the cava bars from (mpd-spectrum)")
     ap.add_argument("--bridge-scale", type=_positive, default=DEFAULTS["bridge_scale"],
-                    help="media delle barre (0-100) che corrisponde al livello massimo")
-    ap.add_argument("--audio-device", default=None, help="parte del nome del dispositivo di cattura")
-    ap.add_argument("--audio-gain", type=float, default=0.0, help="dB aggiunti al livello audio")
-    ap.add_argument("--max-mbps", type=_positive, default=DEFAULTS["max_mbps"], help="Mbit/s = effetto massimo (scala log)")
-    ap.add_argument("--tri-size", type=_positive, default=DEFAULTS["tri_size"], help="moltiplicatore della dimensione dei triangoli")
+                    help="average of the bars (0-100) that maps to full level")
+    ap.add_argument("--audio-device", default=None, help="part of the capture device name")
+    ap.add_argument("--audio-gain", type=float, default=0.0, help="dB added to the audio level")
+    ap.add_argument("--max-mbps", type=_positive, default=DEFAULTS["max_mbps"], help="Mbit/s = maximum effect (log scale)")
+    ap.add_argument("--tri-size", type=_positive, default=DEFAULTS["tri_size"], help="size multiplier for the triangles")
     ap.add_argument("--display", default="auto",
-                    help="monitor su cui aprire la finestra: auto = quello del terminale da cui si lancia "
-                         "(Wayland/labwc), oppure l'indice 0, 1, ... nell'ordine di SDL")
-    ap.add_argument("--size", default="1280x800", help="finestra LxA")
+                    help="monitor to open the window on: auto = the one with the launching terminal "
+                         "(Wayland/labwc), or the index 0, 1, ... in SDL order")
+    ap.add_argument("--size", default="1280x800", help="window WxH")
     load_config(ap)
     a = ap.parse_args()
+    import hringr_web          # solo journal_cfg (import qui: hringr_web importa questo modulo)
+    import journal_stream
+    jcfg = hringr_web.journal_cfg(read_config(a.config))
+    journal = None
+    if jcfg["enabled"]:
+        journal = journal_stream.Journal(jcfg["message_max"], save_path=jcfg["save_path"],
+                                         save_max_kb=jcfg["save_max_kb"])
+        journal.start()
+    panel = JournalPanel(jcfg, journal)
 
     import moderngl
     import pygame
@@ -858,17 +1191,17 @@ def main():
                 disp = idx
             elif (ow, oh) in [tuple(x) for x in sizes]:
                 disp = [tuple(x) for x in sizes].index((ow, oh))
-            print(f"hringr: terminale su {nm} ({ow}x{oh}) -> display {disp}")
+            print(f"hringr: terminal on {nm} ({ow}x{oh}) -> display {disp}")
         else:
             disp = 0
-            print("hringr: monitor del terminale non rilevabile, uso display 0")
+            print("hringr: terminal monitor not detected, using display 0")
     else:
         try:
             disp = int(a.display)
         except ValueError:
-            ap.error("--display deve essere 'auto' o un numero")
+            ap.error("--display must be 'auto' or a number")
         if not 0 <= disp < len(sizes):
-            ap.error(f"--display {disp}: monitor disponibili 0..{len(sizes) - 1} {sizes}")
+            ap.error(f"--display {disp}: available monitors 0..{len(sizes) - 1} {sizes}")
     flags = pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE
 
     def real_size():
@@ -906,6 +1239,8 @@ def main():
     running = True
     while running:
         for e in pygame.event.get():
+            if panel and panel.event(e):
+                continue
             if e.type == pygame.QUIT:
                 running = False
             elif e.type == pygame.KEYDOWN:
@@ -925,8 +1260,9 @@ def main():
             demo_signals(dsig, now - t0)
         s = dsig if demo else sig
         scene.update(dt, s.audio, net_norm(s.down_mbps, a.max_mbps),
-                     net_norm(s.up_mbps, a.max_mbps), s.cpu, s.ram, W, H)
-        rend.draw(scene, W, H)
+                     net_norm(s.up_mbps, a.max_mbps), s.cpu, s.ram, W, H, s.swap)
+        ov, top = panel.draw(W, H, s)
+        rend.draw(scene, W, H, ov, top)
         pygame.display.flip()
         clock.tick(60)
 
@@ -936,6 +1272,8 @@ def main():
                 f"audio {s.audio:.2f} | ↓ {s.down_mbps:.1f} ↑ {s.up_mbps:.1f} Mbit/s"
                 f" | CPU {s.cpu:.0%} RAM {s.ram:.0%} | {len(scene.pos)} tri"
                 f" | {'DEMO' if demo else sig.audio_status}")
+    if journal:
+        journal.stop()
     pygame.quit()
 
 

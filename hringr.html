@@ -10,12 +10,33 @@ SPDX-License-Identifier: AGPL-3.0-or-later
 <title>hringr</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #c { position: fixed; left: 0; top: 0; z-index: 1; pointer-events: none; }   /* anello sempre sopra il journal; i clic passano */
   canvas { display: block; width: 100vw; height: 100vh; }
   :fullscreen { cursor: none; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
+<canvas id="jr" style="position:fixed;left:0;top:0;z-index:0"></canvas>
+<button id="jmute" title="mute notifications" aria-label="mute notifications" style="position:fixed;top:12px;right:12px;z-index:5;display:none;width:26px;height:26px;padding:0;box-sizing:border-box;background:rgba(6,8,12,.85);border:1px solid #4a5a6a;color:#b4c2d1;cursor:pointer;align-items:center;justify-content:center">
+  <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true"><path d="M2 2L14 14M14 2L2 14" stroke="currentColor" stroke-width="1.8" fill="none"/></svg>
+</button>
+<button id="jerr" title="errors and warnings only" aria-label="errors and warnings only" style="position:fixed;top:12px;z-index:5;display:none;width:26px;height:26px;padding:0;box-sizing:border-box;background:rgba(6,8,12,.85);border:1px solid #4a5a6a;color:#b4c2d1;cursor:pointer;align-items:center;justify-content:center;font:700 15px 'Chakra Petch',ui-monospace,monospace;right:46px">!</button>
+<button id="jibtn" title="info" aria-label="info" style="position:fixed;top:12px;right:80px;z-index:5;display:flex;width:26px;height:26px;padding:0;box-sizing:border-box;background:rgba(6,8,12,.85);border:1px solid #4a5a6a;color:#b4c2d1;cursor:pointer;align-items:center;justify-content:center;font:700 15px 'Chakra Petch',ui-monospace,monospace">i</button>
+<div id="jinfo" style="position:fixed;left:50%;transform:translateX(-50%);z-index:2;display:none;box-sizing:border-box;pointer-events:none;white-space:nowrap;filter:drop-shadow(0 0 8px rgba(141,160,179,.35))">
+  <svg id="jinfo-svg" style="position:absolute;left:0;top:0;width:100%;height:100%;overflow:visible" aria-hidden="true"><polygon id="jinfo-poly" fill="none" stroke="#8da0b3" stroke-width="1"/></svg>
+  <div id="jinfo-in" style="position:relative;box-sizing:border-box;text-transform:uppercase;padding:.6em 1em;background:rgba(6,8,12,.5);clip-path:polygon(var(--c) 0,100% 0,100% calc(100% - var(--c)),calc(100% - var(--c)) 100%,0 100%,0 var(--c));color:#e8f1fb;text-align:center">
+  <div id="jinfo-host" style="font:600 28px 'Chakra Petch',ui-monospace,monospace;letter-spacing:.08em"></div>
+  <div id="jinfo-up" style="font:18px 'Share Tech Mono',ui-monospace,monospace;color:#b4c2d1;margin-top:.3em"></div>
+  <div id="jinfo-mode" style="font:18px 'Share Tech Mono',ui-monospace,monospace;color:#8da0b3;margin-top:.2em"></div>
+  </div>
+</div>
+<div id="jbar" style="position:fixed;left:0;right:0;bottom:0;height:40px;z-index:3;display:none;align-items:center;gap:12px;padding:0 12px;box-sizing:border-box;background:rgba(6,8,12,.92);border-top:1px solid #1c2a38;font:14px 'Share Tech Mono',ui-monospace,monospace;color:#b4c2d1">
+  <span id="jst" style="flex:1 1 auto;min-width:0;overflow:hidden;white-space:pre;color:#8da0b3;font-size:13px"></span>
+  <label style="white-space:nowrap"><input type="checkbox" id="jfon"> filter</label>
+  <input id="jq" placeholder="level:err unit:nginx text -word" autocomplete="off" spellcheck="false" style="flex:0 1 420px;min-width:0;background:#0b1118;color:#dce6f2;border:1px solid #1c2a38;padding:6px 8px;font:inherit">
+</div>
+<div id="jbig" style="position:fixed;left:16px;right:16px;bottom:56px;z-index:4;display:none;max-height:40vh;overflow:auto;box-sizing:border-box;padding:14px 16px;background:rgba(6,8,12,.95);border:1px solid #1c2a38;font:14px 'Share Tech Mono',ui-monospace,monospace;cursor:pointer"></div>
 <script>
 "use strict";
 // Port in WebGL2 di hringr.py: costanti condivise (params.json), stessa scena, stessi shader (GLSL ES 3.00).
@@ -43,7 +64,7 @@ const netNorm = (mbps, max) => Math.min(1, Math.log1p(Math.max(mbps, 0)) / Math.
 // ------------------------------------------------------------------ scena
 class Scene {
   constructor(sizeMul, shape, inner, liq) {
-    Object.assign(this, { sizeMul, shape, inner, liq, flow: 0, level: 0, pin: 0, bri: 0, pulses: [],
+    Object.assign(this, { sizeMul, shape, inner, liq, flow: 0, level: 0, pin: 0, bri: 0, glitch: 0, pulses: [],
                           pulseTimer: 0, flash: 0, time: 0, r0: 1, n: 0, sc: 1 });
     this.phase = new Float32Array(WAVES.length);
     this.tab = new Float32Array(TAB_N * 2);               // riga 0: perimetro, riga 1: eco
@@ -84,8 +105,9 @@ class Scene {
     this.ph[i] = rnd(0, 2 * Math.PI);
     this.n++;
   }
-  update(dt, audio, down, up, cpu, ram, w, h) {
+  update(dt, audio, down, up, cpu, ram, w, h, swap = 0) {
     this.time += dt;
+    this.glitch += (swap - this.glitch) * (1 - Math.exp(-dt / (swap > this.glitch ? 0.05 : 0.5)));
     this.level += (audio - this.level) * (1 - Math.exp(-dt / (audio > this.level ? 0.03 : 0.25)));
     for (let j = 0; j < WAVES.length; j++) this.phase[j] += WAVES[j][2] * (1 + 5 * this.level) * dt;
     this.r0 = 0.30 * Math.min(w, h);
@@ -126,7 +148,9 @@ class Scene {
     }
     // movimento e rimozione (swap con l'ultimo: l'ordine non conta)
     for (let i = 0; i < this.n;) {
-      const px = this.px[i] += this.dx[i] * this.spd[i] * dt, py = this.py[i] += this.dy[i] * this.spd[i] * dt;
+      const u = (Math.hypot(this.px[i], this.py[i]) - this.radius(Math.atan2(this.py[i], this.px[i]))) / this.r0;
+      const m = this.kind[i] === 0 ? 1 + 2.2 * Math.exp(-u / 0.25) : 0.3 + 1.7 * (1 - Math.exp(-Math.max(u, 0) / 0.2));
+      const px = this.px[i] += this.dx[i] * this.spd[i] * m * dt, py = this.py[i] += this.dy[i] * this.spd[i] * m * dt;
       const r = Math.hypot(px, py), ring = this.radius(Math.atan2(py, px));
       const k = this.kind[i];
       if ((k === 0 && r <= ring) || (k === 1 && r > halfDiag + 40)) {
@@ -210,6 +234,7 @@ uniform sampler2D u_tab;
 uniform vec3  u_core, u_glow, u_halo, u_echo, u_pcol, u_liq;
 uniform vec2  u_pulse[6];
 uniform float u_liquid, u_flow, u_energy, u_r0;
+uniform float u_glitch, u_time;
 out vec4 frag;
 const int N = 512;
 const float PI = 3.14159265;
@@ -222,8 +247,7 @@ float tab(float u, int row){
     return mix(texelFetch(u_tab, ivec2(i0, row), 0).r,
                texelFetch(u_tab, ivec2(i1, row), 0).r, f);
 }
-void main(){
-    vec2 p = gl_FragCoord.xy - 0.5 * u_res;
+vec3 shade(vec2 p){
     float r = length(p);
     float u = (atan(p.y, p.x) + PI) / (2.0 * PI) * float(N);
     float R = tab(u, 0);
@@ -269,8 +293,23 @@ void main(){
     float fg = 1.0 + 0.35 * u_flash;
     vec3 col = core * f * mix(u_core, vec3(0.93, 0.93, 0.94), min(1.0, u_level + 0.5 * u_flash))
              + near * fg * u_glow + far * fg * u_halo + echo * u_echo + pul * u_pcol + liq;
-    frag = vec4(min(col, vec3(1.0)), 1.0);
-}`;
+    return col;
+}
+float hash(vec2 q){ return fract(sin(dot(q, vec2(127.1, 311.7))) * 43758.5453); }
+void main(){
+    // glitch da swap: righe spezzate e sfarfallio nella zona dell'anello (dentro 1.7 r0), più fitti con u_glitch
+    vec2 p = gl_FragCoord.xy - 0.5 * u_res;
+    float g = u_glitch, zone = 1.0 - smoothstep(1.2 * u_r0, 1.7 * u_r0, length(p));
+    float slot = floor(u_time * 12.0), band = floor(gl_FragCoord.y / 14.0);
+    float cut = step(1.0 - 0.7 * g, hash(vec2(band, slot)));
+    p.x += zone * cut * (hash(vec2(slot, band)) - 0.5) * 90.0 * u_sc * g;
+    vec3 c = shade(p) * (1.0 + zone * g * 0.25 * (hash(vec2(slot, 7.0)) - 0.5));
+    float spark = zone * step(1.0 - 0.10 * g, hash(floor(gl_FragCoord.xy / 3.0) + floor(u_time * 30.0)));
+    c = min(c + spark * vec3(0.35, 0.9, 1.0) * g, vec3(1.0));
+    frag = vec4(c, max(max(c.r, c.g), c.b));  // trasparente dove non c'è anello
+}
+`;
+
 const TRI_VS = HEAD + `
 uniform vec2 u_res;
 layout(location=0) in vec2 in_pos;
@@ -329,8 +368,8 @@ void main(){
 // ------------------------------------------------------------------ rendering
 class Renderer {
   constructor(canvas) {
-    const gl = this.gl = canvas.getContext("webgl2", { alpha: false, antialias: false, powerPreference: "high-performance" });
-    if (!gl) throw new Error("WebGL2 non disponibile in questo browser");
+    const gl = this.gl = canvas.getContext("webgl2", { alpha: true, premultipliedAlpha: true, antialias: false, powerPreference: "high-performance" });
+    if (!gl) throw new Error("WebGL2 is not available in this browser");
     const mk = (vs, fs) => {
       const p = gl.createProgram();
       for (const [t, s] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
@@ -366,7 +405,7 @@ class Renderer {
   draw(s, w, h) {
     const gl = this.gl;
     gl.viewport(0, 0, w, h);
-    gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
     gl.disable(gl.BLEND);
     const sc = Math.min(w, h) / 800, r = this.ring;
     gl.useProgram(r);
@@ -375,12 +414,14 @@ class Renderer {
     gl.uniform1f(r.u("u_sc"), sc);
     gl.uniform1f(r.u("u_level"), s.level);
     gl.uniform1f(r.u("u_flash"), s.flash);
-    gl.uniform3fv(r.u("u_core"), RING_CORE); gl.uniform3fv(r.u("u_glow"), RING_GLOW);
-    gl.uniform3fv(r.u("u_halo"), RING_HALO); gl.uniform3fv(r.u("u_echo"), RING_ECHO);
+    const tk = s.tintK || 0, mx = (a, m) => a.map((v, i) => v + (s.tint[i] - v) * m * tk);   // colore dell'anello -> colore dei messaggi
+    gl.uniform3fv(r.u("u_core"), tk ? mx(RING_CORE, 0.5) : RING_CORE); gl.uniform3fv(r.u("u_glow"), tk ? mx(RING_GLOW, 1) : RING_GLOW);
+    gl.uniform3fv(r.u("u_halo"), tk ? mx(RING_HALO, 1) : RING_HALO); gl.uniform3fv(r.u("u_echo"), tk ? mx(RING_ECHO, 0.8) : RING_ECHO);
     gl.uniform3fv(r.u("u_pcol"), PULSE_COL); gl.uniform3fv(r.u("u_liq"), s.liq);
     gl.uniform2fv(r.u("u_pulse[0]"), s.pulseUniform());
     gl.uniform1f(r.u("u_liquid"), s.inner === "liquid" ? 1 : 0);
     gl.uniform1f(r.u("u_flow"), s.flow); gl.uniform1f(r.u("u_energy"), s.bri); gl.uniform1f(r.u("u_r0"), s.r0);
+    gl.uniform1f(r.u("u_glitch"), s.glitch); gl.uniform1f(r.u("u_time"), s.time);
     gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, this.tex);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.R32F, TAB_N, 2, 0, gl.RED, gl.FLOAT, s.tab);
     gl.uniform1i(r.u("u_tab"), 0);
@@ -409,14 +450,201 @@ class Renderer {
 
 // ------------------------------------------------------------------ segnali e ciclo principale
 const P = new URLSearchParams(location.search);
-const sig = { audio: 0, down_mbps: 0, up_mbps: 0, cpu: 0, ram: 0, audio_status: "in avvio", source: "?" };
+const sig = { audio: 0, down_mbps: 0, up_mbps: 0, cpu: 0, ram: 0, swap: 0, swap_pps: 0, uptime: 0, audio_status: "starting", source: "?" };
 const demoSig = t => {
   const burst = Math.pow(Math.max(0, Math.sin(t * 0.7)), 2);
   return { audio: Math.min(1, 0.08 + 0.9 * burst * (0.6 + 0.4 * Math.pow(Math.sin(t * 9), 2))),
            down_mbps: 200 * Math.pow(Math.max(0, Math.sin(t * 0.37 + 1)), 3),
            up_mbps: 80 * Math.pow(Math.max(0, Math.sin(t * 0.53 + 3)), 3),
-           cpu: 0.5 + 0.5 * Math.sin(t * 0.3), ram: 0.55 + 0.2 * Math.sin(t * 0.1), audio_status: "DEMO" };
+           cpu: 0.5 + 0.5 * Math.sin(t * 0.3), ram: 0.55 + 0.2 * Math.sin(t * 0.1),
+           uptime: 90061 + t, swap: 0.9 * Math.pow(Math.max(0, Math.sin(t * 0.23 + 2)), 4), swap_pps: 540 * Math.pow(Math.max(0, Math.sin(t * 0.23 + 2)), 4), audio_status: "DEMO" };
 };
+
+
+// ------------------------------------------------------------------ journal di systemd (overlay 2D)
+// Un punto = "questa unità ha registrato un messaggio". Nessuna linea tra corsie: il journal non dice chi ha causato cosa.
+const GLYPHS = "01▌▒░/\\#%$<>";   // caratteri della "decifrazione" alla nascita
+const PN = ["EMERG", "ALERT", "CRIT", "ERR", "WARN", "NOTICE", "INFO", "DEBUG"];
+const PR = { emerg: 0, emergency: 0, alert: 1, crit: 2, critical: 2, err: 3, error: 3, warn: 4, warning: 4, notice: 5, info: 6, debug: 7 };
+// query: parole (cercate in unità e messaggio), unit:nome, level:err (= err o più grave), -termine per escludere
+const matchQ = (e, q) => q.trim().toLowerCase().split(/\s+/).filter(Boolean).every(t => {
+  const neg = t[0] === "-" && t.length > 1, body = neg ? t.slice(1) : t, i = body.indexOf(":");
+  const k = i > 0 ? body.slice(0, i) : "", v = i > 0 ? body.slice(i + 1) : "";
+  let ok;
+  if (k === "unit" || k === "u") ok = e.u.toLowerCase().includes(v);
+  else if (k === "level" || k === "prio" || k === "p") ok = Object.hasOwn(PR, v) && e.p <= PR[v];
+  else ok = (e.u + " " + e.m).toLowerCase().includes(body);
+  return neg ? !ok : ok;
+});
+
+class JournalView {
+  constructor(cfg, src, scene) {
+    Object.assign(this, { cfg, scene, ev: [], lanes: new Map(), counts: Array(8).fill(0), status: "starting",
+                          amt: 0, cv: document.getElementById("jr") });
+    this.col = cfg.colors.map(hex);
+    this.base = scene.liq.slice(); this.cur = this.base.slice(); this.kl = 0; this.kr = 0; this.mix = [];
+    this.es = new EventSource(src);
+    this.es.onmessage = e => this.add(JSON.parse(e.data));
+    this.errOnly = false; this.hits = []; this.jfon = document.getElementById("jfon"); this.jq = document.getElementById("jq");
+    document.getElementById("jbar").style.display = "flex";
+    const mb = document.getElementById("jmute"); mb.style.display = "flex";
+    mb.onclick = () => this.setMute(!this.muted);
+    const eb = document.getElementById("jerr"); eb.style.display = "flex";
+    eb.onclick = () => { this.errOnly = !this.errOnly; eb.style.borderColor = this.errOnly ? "#FFD60A" : "#4a5a6a"; eb.style.color = this.errOnly ? "#FFD60A" : "#b4c2d1"; };
+    this.cv.addEventListener("click", ev => this.click(ev));
+    document.getElementById("jbig").onclick = () => this.close();
+    this.es.onerror = () => { this.status = "stream interrupted"; };
+  }
+  add(m) {
+    this.counts = m.counts; this.status = m.status;
+    const now = performance.now() / 1000;
+    for (const e of m.ev) {
+      e.born = now;                                    // la timeline usa l'ora di arrivo nel browser
+      this.ev.push(e);
+      const l = this.lanes.get(e.u) ?? { n: 0, last: 0 };
+      l.n++; l.last = now; this.lanes.set(e.u, l);
+      // priorità alta = goccia di colore più forte; si mescola al liquido già presente
+      const w = [1.2, 1.2, 1, 0.7, 0.4, 0.12, 0.06, 0.02][e.p];
+      this.mix.push({ col: this.col[e.p], w: [1, 1, 1, 1.6, 0.7, 0.5, 0.4, 0.25][e.p], t: now });   // contributo al colore, vedi update()
+      this.amt = Math.min(1, this.amt + w);
+    }
+    if (this.mix.length > 80) this.mix.splice(0, this.mix.length - 80);
+    if (this.ev.length > this.cfg.max_events) this.ev.splice(0, this.ev.length - this.cfg.max_events);
+  }
+  update(dt) {
+    // compromesso: il liquido risponde quasi subito (tau 0,25 s), l'anello un poco dopo (tau 0,7 s), il colore scivola (tau 0,2 s)
+    this.amt *= Math.exp(-dt / 6);
+    const target = Math.min(1, this.amt) * this.cfg.ring_tint, ease = t => 1 - Math.exp(-dt / t);
+    this.kl += (target - this.kl) * ease(0.25);
+    this.kr += (target - this.kr) * ease(0.7);
+    // colore = miscela dei messaggi recenti: ognuno entra piano (tau 1,2 s) ed esce piano (tau 6 s), quindi l'ultimo arrivato
+    // prende il sopravvento gradualmente; 3 azzurri e 1 rosso danno un azzurro che vira lentamente verso il rosso
+    const now = performance.now() / 1000;
+    this.mix = this.mix.filter(m => now - m.t < 25);
+    let sw = 0; const acc = [0, 0, 0];
+    for (const m of this.mix) {
+      const a = now - m.t, wt = m.w * (1 - Math.exp(-a / 1.2)) * Math.exp(-a / 6);
+      sw += wt; for (let i = 0; i < 3; i++) acc[i] += m.col[i] * wt;
+    }
+    if (sw > 1e-3) this.cur = this.cur.map((v, i) => v + (acc[i] / sw - v) * ease(0.2));
+    this.scene.liq = this.base.map((b, i) => b + (this.cur[i] - b) * this.kl);
+    this.scene.tint = this.cur; this.scene.tintK = this.kr;   // il renderer tinge anche alone, eco e bordo
+  }
+  click(ev) {
+    if (ev.detail > 1) return;                        // doppio clic = schermo intero, non apre il dettaglio
+    const hit = this.hits.find(r => ev.clientX >= r.x && ev.clientX <= r.x + r.w && ev.clientY >= r.y && ev.clientY <= r.y + r.h);
+    if (hit) this.open(hit.e);
+  }
+  open(e) {
+    // dettaglio = stessa bubble ingrandita: stessa forma a spigoli tagliati, stessa disposizione, font un po' più grandi
+    const box = document.getElementById("jbig");
+    if (box.dataset.id === String(e.id) && box.style.display === "block") return this.close();
+    const f = this.f || 14, c = f * 1.1, pad = f, col = "#" + this.cfg.colors[e.p];
+    const poly = k => `polygon(${k}px 0, 100% 0, 100% calc(100% - ${k}px), calc(100% - ${k}px) 100%, 0 100%, 0 ${k}px)`;
+    const inner = document.createElement("div"), top = document.createElement("div"), right = document.createElement("div");
+    const body = document.createElement("div"), left = document.createElement("span");
+    box.style.cssText = `position:fixed;left:16px;right:16px;bottom:56px;z-index:4;cursor:pointer;background:${col};clip-path:${poly(c)};padding:1px;box-sizing:border-box;box-shadow:0 0 ${f}px ${col}55`;
+    inner.style.cssText = `background:linear-gradient(90deg, ${col}40, transparent 60%), rgba(6,8,12,0.92);clip-path:${poly(c)};padding:${pad}px;max-height:40vh;overflow:auto;box-sizing:border-box`;
+    top.style.cssText = `display:flex;justify-content:space-between;align-items:baseline;gap:${pad}px;font:600 ${Math.max(10, Math.round(f * 0.72))}px 'Chakra Petch',ui-monospace,monospace`;
+    left.style.color = "#b4c2d1"; left.textContent = e.u.replace(/\.service$/, "");
+    right.style.cssText = "white-space:nowrap;color:#8da0b3";
+    const pr = document.createElement("span"); pr.style.color = col; pr.textContent = PN[e.p].toLowerCase() + " ";
+    right.append(pr, new Date(e.t * 1000).toTimeString().slice(0, 8));
+    top.append(left, right);
+    body.style.cssText = `margin-top:${f * 0.6}px;font:${Math.round(f * 0.82 * 1.15)}px 'Share Tech Mono',ui-monospace,monospace;color:#e8f1fb;white-space:pre-wrap;overflow-wrap:anywhere`;
+    body.textContent = e.m;
+    inner.append(top, body);
+    box.replaceChildren(inner); box.dataset.id = e.id; box.style.display = "block";
+  }
+  close() { document.getElementById("jbig").style.display = "none"; }
+  setMute(m) {                                         // silenzia: nasconde bubble, dettaglio e filtro; i messaggi continuano ad arrivare
+    this.muted = m;
+    const mb = document.getElementById("jmute");
+    mb.style.borderColor = m ? "#ff2a3d" : "#4a5a6a"; mb.style.color = m ? "#ff2a3d" : "#b4c2d1";
+    mb.title = mb.ariaLabel = m ? "unmute notifications" : "mute notifications";
+    document.getElementById("jbar").style.display = m ? "none" : "flex";
+    if (m) this.close();
+  }
+  draw(w, h) {
+    // bubble separate in alto: 1 colonna su telefono, fino a 3 su monitor larghi; l'anello è disegnato sopra
+    const c = this.cv, cfg = this.cfg, now = performance.now() / 1000, sc = w / c.clientWidth;
+    const H = Math.round(h * cfg.height);
+    if (c.width !== w || c.height !== H) { c.width = w; c.height = H; c.style.height = cfg.height * 100 + "vh"; }
+    const g = c.getContext("2d");
+    // corpo del messaggio: 1,6% dell'altezza della finestra (leggibile da lontano), limitato dalla larghezza, per font_scale
+    const fs = Math.max(12, Math.round(Math.min(h * 0.016, w / 30) * cfg.font_scale)), f = fs / 0.82, pad = f, gap = f * 0.6;
+    this.f = f;
+    const cut = (x, y, bw, bh, c) => {                 // pannello con due spigoli tagliati
+      g.beginPath(); g.moveTo(x + c, y); g.lineTo(x + bw, y); g.lineTo(x + bw, y + bh - c);
+      g.lineTo(x + bw - c, y + bh); g.lineTo(x, y + bh); g.lineTo(x, y + c); g.closePath();
+    };
+    const fit = (s, maxW) => { while (s.length > 1 && g.measureText(s).width > maxW) s = s.slice(0, -2) + "…"; return s; };
+    g.clearRect(0, 0, w, H);
+    if (this.muted) { this.hits = []; return; }
+    this.ev = this.ev.filter(e => now - e.born < cfg.window_s);
+    for (const [u, l] of this.lanes) if (now - l.last > cfg.window_s) this.lanes.delete(u);
+    g.font = `${f}px ui-monospace, monospace`; g.textBaseline = "middle"; g.textAlign = "left";
+    const cols = Math.max(1, Math.min(3, Math.floor((w - 2 * pad + gap) / (f * 24))));
+    const bw = (w - 2 * pad - (cols - 1) * gap) / cols, bh = f * 3.4;
+    const calm = !matchMedia("(prefers-reduced-motion: reduce)").matches && this.ev.reduce((a, e) => a + (now - e.born < 1), 0) <= 3;
+    // stato (es. "stream interrupted"): una bubble più grande, come le altre, che sfuma dopo qualche secondo
+    if (this.status !== this.lastStatus) { this.lastStatus = this.status; this.statT = now; }
+    const sAge = now - this.statT, sOn = cfg.status_label && sAge < 5;
+    let by = pad * 2 + f;
+    if (sOn) {
+      const bwS = Math.min(w - 2 * pad, f * 40), bhS = f * 5.4, aS = cfg.opacity * Math.min(1, sAge * 4) * Math.min(1, (5 - sAge) * 2);
+      g.globalAlpha = aS; cut(pad, by, bwS, bhS, f * 1.1);
+      g.fillStyle = "rgba(6,8,12,0.92)"; g.fill(); g.strokeStyle = "#8da0b3"; g.lineWidth = 1; g.stroke();
+      g.textAlign = "left"; g.fillStyle = "#b4c2d1"; g.font = `600 ${Math.round(f * 0.9)}px 'Chakra Petch', ui-monospace, monospace`;
+      g.fillText("journal", pad * 2, by + f * 1.1);
+      g.fillStyle = "#e8f1fb"; g.font = `${Math.round(f * 1.6)}px 'Share Tech Mono', ui-monospace, monospace`;
+      g.fillText(fit(this.status, bwS - pad * 4), pad * 2, by + bhS * 0.62);
+      by += bhS + gap;
+    }
+    let col = 0;
+    const q = this.jq.value, base = this.errOnly ? this.ev.filter(e => e.p <= 4) : this.ev;   // errOnly: solo emerg..warning
+    const filt = this.jfon.checked && q.trim() ? base.filter(e => matchQ(e, q)) : base;
+    this.hits = [];
+    for (const e of [...filt].reverse()) {
+      if (by + bh > H) break;                          // niente spazio: i più vecchi non si vedono
+      const age = now - e.born, bx = pad + col * (bw + gap);
+      const life = 1 - age / (cfg.window_s * 0.7);
+      if (life < 0.12) continue;
+      this.hits.push({ x: bx / sc, y: by / sc, w: bw / sc, h: bh / sc, e });
+      const alpha = cfg.opacity * Math.min(1, age * 4) * Math.min(1, life * 2);
+      const cc = "#" + cfg.colors[e.p], c = f * 1.1, flash = Math.max(0, 1 - age * 2.5), glitch = calm ? Math.max(0, 1 - age / 0.35) : 0;
+      const jx = glitch ? (Math.random() - 0.5) * f * 0.9 * glitch : 0;     // sbandata orizzontale alla nascita
+      g.globalAlpha = alpha;
+      cut(bx + jx, by, bw, bh, c);
+      g.fillStyle = "rgba(6,8,12,0.92)"; g.fill();
+      const wash = g.createLinearGradient(bx, by, bx + bw, by);            // velo di colore a sinistra, poi grana e righe di scansione
+      wash.addColorStop(0, cc + (e.p <= 4 ? "40" : "14")); wash.addColorStop(0.6, cc + "00");
+      g.fillStyle = wash; g.fill();
+      g.shadowColor = cc; g.shadowBlur = e.p <= 3 ? f * 1.1 : (e.p <= 4 ? flash * f * 1.4 : 0);   // alone: priorità alte, o bordo che si accende alla nascita
+      g.strokeStyle = cc; g.lineWidth = 1 + flash; g.globalAlpha = alpha * (e.p <= 4 ? 0.5 : 0.35) * (1 + flash); g.stroke();
+      g.shadowBlur = 0; g.globalAlpha = alpha;
+      g.font = `600 ${Math.max(10, Math.round(f * 0.72))}px "Chakra Petch", ui-monospace, monospace`;
+      const time = new Date(e.t * 1000).toTimeString().slice(0, 8), pr = PN[e.p].toLowerCase();
+      g.textAlign = "right"; g.fillStyle = "#8da0b3"; g.fillText(time, bx + jx + bw - pad - c * 0.3, by + f * 0.95);
+      const tx = bx + jx + bw - pad - c * 0.3 - g.measureText(time + "  ").width;
+      g.fillStyle = cc; g.fillText(pr, tx, by + f * 0.95);                  // la priorità è l'unico testo colorato
+      g.textAlign = "left"; g.fillStyle = "#b4c2d1";
+      g.fillText(fit(e.u.replace(/\.service$/, ""), bw - pad * 2 - (bx + jx + bw - pad - tx) - f), bx + jx + pad, by + f * 0.95);
+      g.textAlign = "left"; g.font = `${Math.max(11, Math.round(f * 0.82))}px "Share Tech Mono", ui-monospace, monospace`;
+      const full = fit(e.m, bw - pad * 2), n = calm ? Math.floor(full.length * Math.min(1, age / 0.5)) : full.length;
+      const txt = full.slice(0, n) + [...full.slice(n)].map(ch => ch === " " ? ch : GLYPHS[(Math.random() * GLYPHS.length) | 0]).join("");
+      if (glitch) {                                                         // aberrazione cromatica breve
+        g.globalAlpha = alpha * 0.7 * glitch;
+        g.fillStyle = "#ff2bd6"; g.fillText(txt, bx + jx + pad - 2, by + f * 2.15);
+        g.fillStyle = "#00f0ff"; g.fillText(txt, bx + jx + pad + 2, by + f * 2.15);
+        g.globalAlpha = alpha;
+      }
+      g.fillStyle = "#e8f1fb"; g.fillText(txt, bx + jx + pad, by + f * 2.15);
+      if (++col === cols) { col = 0; by += bh + gap; }
+    }
+    g.globalAlpha = 1;
+  }
+}
 
 (async () => {
   // Servita da un altro web server (porta 80), la pagina cerca i segnali su :8766 (o ?server=http://host:porta)
@@ -425,17 +653,17 @@ const demoSig = t => {
     if (base === null) continue;
     try { const r = await fetch(base + "/config.json"); if (r.ok) { d = await r.json(); SRV = base; break; } } catch (e) { /* prossimo */ }
   }
-  if (SRV === null) throw new Error("server dei segnali non raggiungibile: avvia ./run_web.sh");
+  if (SRV === null) throw new Error("signal server unreachable: start ./run_web.sh");
   setParams(d.params);
   const g = k => P.get(k) ?? d[k];
   const maxMbps = parseFloat(g("max_mbps"));
-  if (!(maxMbps > 0)) throw new Error("max_mbps deve essere maggiore di 0");
+  if (!(maxMbps > 0)) throw new Error("max_mbps must be greater than 0");
   const lc = g("liquid_color").replace("#", "");
-  if (!/^[0-9a-fA-F]{6}$/.test(lc)) throw new Error("liquid_color non valido: servono 6 cifre esadecimali");
+  if (!/^[0-9a-fA-F]{6}$/.test(lc)) throw new Error("invalid liquid_color: 6 hex digits needed");
   const canvas = document.getElementById("c");
   const rend = new Renderer(canvas);
   const triSize = parseFloat(g("tri_size"));
-  if (!(triSize > 0)) throw new Error("tri_size deve essere maggiore di 0");
+  if (!(triSize > 0)) throw new Error("tri_size must be greater than 0");
   const scene = new Scene(triSize, g("shape"), g("inner"), hex(lc));
   let demo = P.has("demo"), audioSrc = g("audio_source"), es;
 
@@ -443,11 +671,18 @@ const demoSig = t => {
     if (es) es.close();
     es = new EventSource(SRV + "/events?audio_source=" + encodeURIComponent(audioSrc));
     es.onmessage = e => Object.assign(sig, JSON.parse(e.data));
-    es.onerror = () => { sig.audio = 0; sig.audio_status = "server non raggiungibile"; };
+    es.onerror = () => { sig.audio = 0; sig.audio_status = "server unreachable"; };
   };
   connect();
+  // d.journal è null se il server lo ha disattivato o se questa pagina non è aperta da localhost
+  // font serviti dal server locale (cartella fonts/): nessuna richiesta esterna; se mancano, resta il monospazio di sistema
+  [["Chakra Petch", "ChakraPetch-SemiBold.ttf", "600"], ["Share Tech Mono", "ShareTechMono-Regular.ttf", "400"]].forEach(([n, f, wt]) =>
+    new FontFace(n, `url(${SRV}/fonts/${f})`, { weight: wt }).load().then(x => document.fonts.add(x)).catch(() => {}));
+  const jv = d.journal ? new JournalView(d.journal, SRV + "/journal", scene) : null;
 
   addEventListener("keydown", e => {
+    if (e.key === "Escape") { if (jv) jv.close(); return; }
+    if (e.target.tagName === "INPUT") return;         // scrivendo nella query, f/d/a non devono agire
     const k = e.key.toLowerCase();
     if (k === "f") toggleFull();
     else if (k === "d") demo = !demo;
@@ -456,7 +691,19 @@ const demoSig = t => {
   const toggleFull = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
   addEventListener("dblclick", toggleFull);
 
-  const t0 = performance.now() / 1000; let last = t0, lastTitle = 0;
+  const t0 = performance.now() / 1000; let last = t0, lastTitle = 0, lastBar = 0;
+  const jst = document.getElementById("jst");
+  const ji = document.getElementById("jinfo"), jib = document.getElementById("jibtn");
+  let infoOn = false, lastInfo = 0;
+  jib.onclick = () => { infoOn = !infoOn; ji.style.display = infoOn ? "block" : "none"; jib.style.borderColor = infoOn ? "#8da0b3" : "#4a5a6a"; };
+  if (!d.journal) jib.style.right = "12px";              // senza journal non ci sono gli altri pulsanti
+  const fmtUp = s => { const dd = Math.floor(s / 86400), h = String(Math.floor(s % 86400 / 3600)).padStart(2, "0"),
+    m = String(Math.floor(s % 3600 / 60)).padStart(2, "0"), x = String(Math.floor(s % 60)).padStart(2, "0");
+    return (dd ? dd + "d " : "") + h + ":" + m + ":" + x; };
+  const placeOutline = c => {                       // come cut() + stroke() dello stato: un tratto di 1px lungo tutto il bordo
+    const W = ji.offsetWidth, H = ji.offsetHeight, o = document.getElementById("jinfo-poly");
+    o.setAttribute("points", `${c + .5},.5 ${W - .5},.5 ${W - .5},${H - c - .5} ${W - c - .5},${H - .5} .5,${H - .5} .5,${c + .5}`);
+  };
   const frame = () => {
     requestAnimationFrame(frame);
     const now = performance.now() / 1000, dt = Math.min(now - last, 0.1);
@@ -465,8 +712,26 @@ const demoSig = t => {
     const w = Math.round(canvas.clientWidth * dpr), h = Math.round(canvas.clientHeight * dpr);
     if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
     const s = demo ? demoSig(now - t0) : sig;
-    scene.update(dt, s.audio, netNorm(s.down_mbps, maxMbps), netNorm(s.up_mbps, maxMbps), s.cpu, s.ram, w, h);
+    scene.update(dt, s.audio, netNorm(s.down_mbps, maxMbps), netNorm(s.up_mbps, maxMbps), s.cpu, s.ram, w, h, s.swap);
+    if (jv) jv.update(dt);
     rend.draw(scene, w, h);
+    if (jv) jv.draw(w, h);
+    if (jst && now - lastBar > 0.2) {                  // barra dei dati su cui si basa hringr, prima del filtro
+      lastBar = now;
+      jst.textContent = `CPU ${String(Math.round(s.cpu * 100)).padStart(3)}%  RAM ${String(Math.round(s.ram * 100)).padStart(3)}%  ↓ ${s.down_mbps.toFixed(1).padStart(6)}  ↑ ${s.up_mbps.toFixed(1).padStart(6)} Mbit/s  SWAP ${s.swap_pps.toFixed(0).padStart(4)} p/s`;
+    }
+    if (infoOn && now - lastInfo > 0.2) {              // riquadro info: sopra l'anello, nella parte bassa
+      lastInfo = now;
+      const dpr = Math.min(devicePixelRatio || 1, 2), r0 = scene.r0 / dpr, fs = Math.max(12, Math.round(Math.min(innerHeight * 0.016, innerWidth / 30) * (d.journal ? d.journal.font_scale : 1)));
+      ji.style.top = (innerHeight / 2 + r0 * 0.3) + "px"; ji.style.width = r0 * 1.5 + "px";
+      ji.style.setProperty("--c", (fs / 0.82 * 1.1) + "px");          // stessi angoli tagliati del dettaglio journal
+      document.getElementById("jinfo-host").style.fontSize = Math.round(fs * 3.2) + "px";
+      document.getElementById("jinfo-host").textContent = (d.hostname || "").toUpperCase();
+      document.getElementById("jinfo-up").style.fontSize = document.getElementById("jinfo-mode").style.fontSize = Math.round(fs * 1.4) + "px";
+      document.getElementById("jinfo-up").textContent = "uptime " + fmtUp(s.uptime);
+      document.getElementById("jinfo-mode").textContent = jv ? (jv.muted ? "journal off" : "journal on") : "journal disabled";
+      placeOutline(fs / 0.82 * 1.1);
+    }
     if (now - lastTitle > 0.5) {
       lastTitle = now;
       document.title = `audio ${s.audio.toFixed(2)} | ↓ ${s.down_mbps.toFixed(1)} ↑ ${s.up_mbps.toFixed(1)} Mbit/s` +
