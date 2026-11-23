@@ -826,7 +826,7 @@ class JournalPanel:
         if self.err_only:
             ev = [e for e in ev if e["p"] <= 4]     # solo emerg..warning, niente log "azzurri"
         ev = [e for e in ev if not self.filter_on or not self.query.strip() or match_query(e, self.query)]
-        by, col = pad, 0
+        by, col = pad * 2 + f, 0                 # sotto i pulsanti in alto a destra (come nel web)
         for e in reversed(ev):
             if by + bh > limit:
                 break
@@ -1225,7 +1225,7 @@ def main():
             pygame.display.set_mode((0, 0), flags | pygame.FULLSCREEN, display=disp, vsync=1)
         else:
             pygame.display.set_mode((w, h), flags, display=disp, vsync=1)
-        pygame.mouse.set_visible(not full)
+        pygame.mouse.set_visible(True)           # anche a schermo intero, come nel web
         ctx = moderngl.create_context(require=310)   # il Pi 5 offre OpenGL 3.1
         return Renderer(ctx), real_size()
 
